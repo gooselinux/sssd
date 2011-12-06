@@ -1,0 +1,34 @@
+From d16e56334d01adf519e342dbd53ffcfe64130691 Mon Sep 17 00:00:00 2001
+From: Sumit Bose <sbose@redhat.com>
+Date: Fri, 25 Jun 2010 17:50:56 +0200
+Subject: [PATCH 2/2] Fix SASL authentication
+
+---
+ src/providers/ldap/sdap_async_connection.c |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/providers/ldap/sdap_async_connection.c b/src/providers/ldap/sdap_async_connection.c
+index 14a1a4b7d2989a1623159cb5ef3caa041d0d5d52..a0224a1c13feeacb738b0c8878817edbed625921 100644
+--- a/src/providers/ldap/sdap_async_connection.c
++++ b/src/providers/ldap/sdap_async_connection.c
+@@ -571,7 +571,7 @@ static int sdap_sasl_interact(LDAP *ld, unsigned flags,
+ 
+         switch (in->id) {
+         case SASL_CB_GETREALM:
+-        case SASL_CB_AUTHNAME:
++        case SASL_CB_USER:
+         case SASL_CB_PASS:
+             if (in->defresult) {
+                 in->result = in->defresult;
+@@ -580,7 +580,7 @@ static int sdap_sasl_interact(LDAP *ld, unsigned flags,
+             }
+             in->len = strlen(in->result);
+             break;
+-        case SASL_CB_USER:
++        case SASL_CB_AUTHNAME:
+             if (state->sasl_user) {
+                 in->result = state->sasl_user;
+             } else if (in->defresult) {
+-- 
+1.7.0.1
+

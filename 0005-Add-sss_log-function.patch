@@ -1,0 +1,326 @@
+From 0e41d65f17d34bf2f7f12e56d595f026fdeab1d6 Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Thu, 8 Jul 2010 10:05:22 -0400
+Subject: [PATCH 5/5] Add sss_log() function
+
+Right now, this log function writes to the syslog. In the future,
+it could be modified to work with ELAPI or another logging API.
+
+Add log notifications for startup and shutdown.
+
+Add syslog messages for LDAP GSSAPI bind
+
+We will now emit a level 0 debug message on keytab errors, and
+also write to the syslog (LOG_DAEMON)
+
+Log TLS errors to syslog
+
+Also adds support for detecting LDAPS errors by adding a check for
+SDAP_DIAGNOSTIC_MESSAGE after ldap_search_ext()
+---
+ src/Makefile.am                            |    3 +-
+ src/providers/ldap/ldap_child.c            |   60 +++++++++++++++++++++++-
+ src/providers/ldap/sdap_async.c            |   18 +++++++-
+ src/providers/ldap/sdap_async_connection.c |    6 ++
+ src/util/server.c                          |    5 ++-
+ src/util/sss_log.c                         |   69 ++++++++++++++++++++++++++++
+ src/util/util.h                            |   12 +++++
+ 7 files changed, 168 insertions(+), 5 deletions(-)
+ create mode 100644 src/util/sss_log.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index d77c731722d9c74ac81f07baa933af3a807eb543..8eea7ac2dd74ca3db86375c92f1ddfbccfa44a65 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -218,7 +218,8 @@ AM_CPPFLAGS = -Wall \
+ EXTRA_DIST = build/config.rpath
+ 
+ SSSD_DEBUG_OBJ = \
+-    util/debug.c
++    util/debug.c \
++    util/sss_log.c
+ 
+ SSSD_UTIL_OBJ = \
+     confdb/confdb.c \
+diff --git a/src/providers/ldap/ldap_child.c b/src/providers/ldap/ldap_child.c
+index 3369d70984f696ca281b676d3f0af68ebc28a7ca..a2e658395d3ee4e3b72c2176b7cf480c4bb1d43b 100644
+--- a/src/providers/ldap/ldap_child.c
++++ b/src/providers/ldap/ldap_child.c
+@@ -136,6 +136,10 @@ static int ldap_child_get_tgt_sync(TALLOC_CTX *memctx,
+     krb5_creds my_creds;
+     krb5_get_init_creds_opt options;
+     krb5_error_code krberr;
++    krb5_kt_cursor cursor;
++    krb5_keytab_entry entry;
++    char *principal;
++    bool found;
+     int ret;
+ 
+     krberr = krb5_init_context(&context);
+@@ -200,8 +204,57 @@ static int ldap_child_get_tgt_sync(TALLOC_CTX *memctx,
+         krberr = krb5_kt_default(context, &keytab);
+     }
+     if (krberr) {
+-        DEBUG(2, ("Failed to read keytab file: %s\n",
++        DEBUG(0, ("Failed to read keytab file: %s\n",
+                   sss_krb5_get_error_message(context, krberr)));
++
++        ret = EFAULT;
++        goto done;
++    }
++
++    /* Verify the keytab */
++    krberr = krb5_kt_start_seq_get(context, keytab, &cursor);
++    if (krberr) {
++        DEBUG(0, ("Cannot read keytab [%s].\n", keytab_name));
++
++        sss_log(SSS_LOG_ERR, "Error reading keytab file [%s]: [%d][%s]. "
++                             "Unable to create GSSAPI-encrypted LDAP connection.",
++                             keytab_name, krberr,
++                             sss_krb5_get_error_message(context, krberr));
++
++        ret = EFAULT;
++        goto done;
++    }
++
++    found = false;
++    while((ret = krb5_kt_next_entry(context, keytab, &entry, &cursor)) == 0){
++        krb5_unparse_name(context, entry.principal, &principal);
++        if (strcmp(full_princ, principal) == 0) {
++            found = true;
++        }
++        free(principal);
++        krb5_free_keytab_entry_contents(context, &entry);
++
++        if (found) {
++            break;
++        }
++    }
++    krberr = krb5_kt_end_seq_get(context, keytab, &cursor);
++    if (krberr) {
++        DEBUG(0, ("Could not close keytab.\n"));
++        sss_log(SSS_LOG_ERR, "Could not close keytab file [%s].",
++                             keytab_name);
++        ret = EFAULT;
++        goto done;
++    }
++
++    if (!found) {
++        DEBUG(0, ("Principal [%s] not found in keytab [%s]\n",
++                  full_princ, keytab_name));
++        sss_log(SSS_LOG_ERR, "Error processing keytab file [%s]: "
++                             "Principal [%s] was not found. "
++                             "Unable to create GSSAPI-encrypted LDAP connection.",
++                             keytab_name, full_princ);
++
+         ret = EFAULT;
+         goto done;
+     }
+@@ -232,8 +285,11 @@ static int ldap_child_get_tgt_sync(TALLOC_CTX *memctx,
+                                         keytab, 0, NULL, &options);
+ 
+     if (krberr) {
+-        DEBUG(2, ("Failed to init credentials: %s\n",
++        DEBUG(0, ("Failed to init credentials: %s\n",
+                   sss_krb5_get_error_message(context, krberr)));
++        sss_log(SSS_LOG_ERR, "Failed to initialize credentials using keytab [%s]: %s. "
++                             "Unable to create GSSAPI-encrypted LDAP connection.",
++                             keytab_name, sss_krb5_get_error_message(context, krberr));
+         ret = EFAULT;
+         goto done;
+     }
+diff --git a/src/providers/ldap/sdap_async.c b/src/providers/ldap/sdap_async.c
+index 18f2bc0c54344535c9ea97697142469e26ffe3c3..fee3c11d053216c1eaf97842b437594d197e46c5 100644
+--- a/src/providers/ldap/sdap_async.c
++++ b/src/providers/ldap/sdap_async.c
+@@ -764,7 +764,9 @@ struct tevent_req *sdap_get_generic_send(TALLOC_CTX *memctx,
+ {
+     struct tevent_req *req = NULL;
+     struct sdap_get_generic_state *state = NULL;
++    char *errmsg;
+     int lret;
++    int optret;
+     int ret;
+     int msgid;
+ 
+@@ -805,7 +807,21 @@ struct tevent_req *sdap_get_generic_send(TALLOC_CTX *memctx,
+         DEBUG(3, ("ldap_search_ext failed: %s\n", ldap_err2string(lret)));
+         if (lret == LDAP_SERVER_DOWN) {
+             ret = ETIMEDOUT;
+-        } else {
++            optret = ldap_get_option(state->sh->ldap,
++                                     SDAP_DIAGNOSTIC_MESSAGE,
++                                     (void*)&errmsg);
++            if (optret == LDAP_SUCCESS) {
++                DEBUG(3, ("Connection error: %s\n", errmsg));
++                sss_log(SSS_LOG_ERR, "LDAP connection error: %s", errmsg);
++                ldap_memfree(errmsg);
++            }
++            else {
++                sss_log(SSS_LOG_ERR, "LDAP connection error, %s",
++                                     ldap_err2string(lret));
++            }
++        }
++
++        else {
+             ret = EIO;
+         }
+         goto fail;
+diff --git a/src/providers/ldap/sdap_async_connection.c b/src/providers/ldap/sdap_async_connection.c
+index fd1cc8c72c99f754b27422ac1debccb8f75f2732..69baf1a347edd84e60e327978ea69d5f583fddc1 100644
+--- a/src/providers/ldap/sdap_async_connection.c
++++ b/src/providers/ldap/sdap_async_connection.c
+@@ -153,11 +153,14 @@ struct tevent_req *sdap_connect_send(TALLOC_CTX *memctx,
+             DEBUG(3, ("ldap_start_tls failed: [%s] [%s]\n",
+                       ldap_err2string(lret),
+                       errmsg));
++            sss_log(SSS_LOG_ERR, "Could not start TLS. %s", errmsg);
+             ldap_memfree(errmsg);
+         }
+         else {
+             DEBUG(3, ("ldap_start_tls failed: [%s]\n",
+                       ldap_err2string(lret)));
++            sss_log(SSS_LOG_ERR, "Could not start TLS. "
++                                 "Check for certificate issues.");
+         }
+         goto fail;
+     }
+@@ -236,11 +239,14 @@ static void sdap_connect_done(struct sdap_op *op,
+             DEBUG(3, ("ldap_install_tls failed: [%s] [%s]\n",
+                       ldap_err2string(ret),
+                       tlserr));
++            sss_log(SSS_LOG_ERR, "Could not start TLS encryption. %s", tlserr);
+             ldap_memfree(tlserr);
+         }
+         else {
+             DEBUG(3, ("ldap_install_tls failed: [%s]\n",
+                       ldap_err2string(ret)));
++            sss_log(SSS_LOG_ERR, "Could not start TLS encryption. "
++                                 "Check for certificate issues.");
+         }
+ 
+         state->result = ret;
+diff --git a/src/util/server.c b/src/util/server.c
+index 4b65da102de11aa1e8a5a1334fdcfd6e1c0d05ce..446e2ea654f64251c20e08fa55643f7ada6f11b8 100644
+--- a/src/util/server.c
++++ b/src/util/server.c
+@@ -228,7 +228,8 @@ void sig_term(int sig)
+ 		kill(-getpgrp(), SIGTERM);
+ 	}
+ #endif
+-	exit(0);
++    sss_log(SSS_LOG_INFO, "Shutting down");
++    exit(0);
+ }
+ 
+ #ifndef HAVE_PRCTL
+@@ -460,6 +461,8 @@ int server_setup(const char *name, int flags,
+         }
+     }
+ 
++    sss_log(SSS_LOG_INFO, "Starting up");
++
+     DEBUG(3, ("CONFDB: %s\n", conf_db));
+ 
+     if (flags & FLAGS_INTERACTIVE) {
+diff --git a/src/util/sss_log.c b/src/util/sss_log.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..45e883109a0a45a146b62dcedf43113147e78c28
+--- /dev/null
++++ b/src/util/sss_log.c
+@@ -0,0 +1,69 @@
++/*
++    SSSD
++
++    sss_log.c
++
++    Authors:
++        Stephen Gallagher <sgallagh@redhat.com>
++
++    Copyright (C) 2010 Red Hat
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "util/util.h"
++#include <syslog.h>
++
++static int sss_to_syslog(int priority)
++{
++    switch(priority) {
++    case SSS_LOG_EMERG:
++        return LOG_EMERG;
++    case SSS_LOG_ALERT:
++        return LOG_ALERT;
++    case SSS_LOG_CRIT:
++        return LOG_CRIT;
++    case SSS_LOG_ERR:
++        return LOG_ERR;
++    case SSS_LOG_WARNING:
++        return LOG_WARNING;
++    case SSS_LOG_NOTICE:
++        return LOG_NOTICE;
++    case SSS_LOG_INFO:
++        return LOG_INFO;
++    case SSS_LOG_DEBUG:
++        return LOG_DEBUG;
++    default:
++        /* If we've been passed an invalid priority, it's
++         * best to assume it's an emergency.
++         */
++        return LOG_EMERG;
++    }
++}
++
++void sss_log(int priority, const char *format, ...)
++{
++    va_list ap;
++    int syslog_priority;
++
++    syslog_priority = sss_to_syslog(priority);
++
++    openlog(debug_prg_name, 0, LOG_DAEMON);
++
++    va_start(ap, format);
++    vsyslog(syslog_priority, format, ap);
++    va_end(ap);
++
++    closelog();
++}
+diff --git a/src/util/util.h b/src/util/util.h
+index 1277305e20694dd9f23392f9ed377e033e1df51f..3c95f7a2005f0fe815628a6985536c6fced24ada 100644
+--- a/src/util/util.h
++++ b/src/util/util.h
+@@ -212,6 +212,18 @@ int open_debug_file_ex(const char *filename, FILE **filep);
+ int open_debug_file(void);
+ int rotate_debug_files(void);
+ 
++/* From sss_log.c */
++#define SSS_LOG_EMERG   0   /* system is unusable */
++#define SSS_LOG_ALERT   1   /* action must be taken immediately */
++#define SSS_LOG_CRIT    2   /* critical conditions */
++#define SSS_LOG_ERR     3   /* error conditions */
++#define SSS_LOG_WARNING 4   /* warning conditions */
++#define SSS_LOG_NOTICE  5   /* normal but significant condition */
++#define SSS_LOG_INFO    6   /* informational */
++#define SSS_LOG_DEBUG   7   /* debug-level messages */
++
++void sss_log(int priority, const char *format, ...);
++
+ /* from server.c */
+ struct main_context {
+     struct tevent_context *event_ctx;
+-- 
+1.7.1.1
+

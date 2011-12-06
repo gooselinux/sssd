@@ -1,0 +1,28 @@
+From 5618e8d8c614166386cfd872c7fedc76c4bc579a Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Wed, 4 Aug 2010 13:42:06 -0400
+Subject: [PATCH 8/8] Fix chpass operations with LDAP provider
+
+The initial verification of the old password was returning an
+error because we were not explicitly setting dp_err to
+DP_ERR_SUCCESS and it was initialized earlier in the function to
+DP_ERR_FATAL.
+---
+ src/providers/ldap/ldap_auth.c |    1 +
+ 1 files changed, 1 insertions(+), 0 deletions(-)
+
+diff --git a/src/providers/ldap/ldap_auth.c b/src/providers/ldap/ldap_auth.c
+index 63719c0730707b1718dd36b9f5db76f1f3f8aebe..b05e3075ce117fad17b87ffde257c80fc035b8c4 100644
+--- a/src/providers/ldap/ldap_auth.c
++++ b/src/providers/ldap/ldap_auth.c
+@@ -865,6 +865,7 @@ static void sdap_auth4chpass_done(struct tevent_req *req)
+         DEBUG(9, ("Initial authentication for change password operation "
+                   "successful.\n"));
+         state->pd->pam_status = PAM_SUCCESS;
++        dp_err = DP_ERR_OK;
+         goto done;
+     }
+ 
+-- 
+1.7.2
+

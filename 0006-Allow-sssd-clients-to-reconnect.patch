@@ -1,0 +1,36 @@
+From 02e3bab1c6ec59080c00b3ca220dedb0dca481ae Mon Sep 17 00:00:00 2001
+From: Sumit Bose <sbose@redhat.com>
+Date: Fri, 23 Jul 2010 15:45:46 +0200
+Subject: [PATCH 6/6] Allow sssd clients to reconnect
+
+Currently the PAM and NSS client just return an error if there are
+problems on an open socket. This will lead to problems in long running
+programs like gdm if sssd is restarted, e.g. during an update. With this
+patch the socket is closed and reopened.
+---
+ src/sss_client/common.c |    7 +++----
+ 1 files changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/src/sss_client/common.c b/src/sss_client/common.c
+index a4856e0884e7151c7aaeaf9f40cae9e767a8a8e9..6b79c783074c2b1e847773e86db2e613d4b3cc63 100644
+--- a/src/sss_client/common.c
++++ b/src/sss_client/common.c
+@@ -607,12 +607,11 @@ static enum sss_status sss_cli_check_socket(int *errnop, const char *socket_name
+             *errnop = EBADF;
+             break;
+         }
+-        if (*errnop) {
+-            sss_cli_close_socket();
+-            return SSS_STATUS_UNAVAIL;
++        if (*errnop == 0) {
++            return SSS_STATUS_SUCCESS;
+         }
+ 
+-        return SSS_STATUS_SUCCESS;
++        sss_cli_close_socket();
+     }
+ 
+     mysd = sss_nss_open_socket(errnop, socket_name);
+-- 
+1.7.1.1
+

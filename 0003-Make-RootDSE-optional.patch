@@ -1,0 +1,63 @@
+From 4dea240ad51ba57e93dab34f7580de32981ae000 Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Thu, 24 Jun 2010 14:06:07 -0400
+Subject: [PATCH 3/3] Make RootDSE optional
+
+In violation of the standard, some LDAP servers control access to
+the RootDSE, thus preventing us from being able to read it before
+performing a bind.
+
+This patch will allow us to continue on if the RootDSE was
+inaccessible. All of the places that we use the return value of
+the RootDSE after this are already checked for NULL and use sane
+defaults if the RootDSE is unavailable
+---
+ src/providers/ldap/sdap_async.c            |    4 +++-
+ src/providers/ldap/sdap_async_connection.c |   16 ++++++++++++++--
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/providers/ldap/sdap_async.c b/src/providers/ldap/sdap_async.c
+index 20828d2b79e72bc47b32d3eaa96b57e0e1945c2f..5c2e2e3e1a6baa8c3d26f38eb8594d3704a09953 100644
+--- a/src/providers/ldap/sdap_async.c
++++ b/src/providers/ldap/sdap_async.c
+@@ -678,7 +678,9 @@ static void sdap_get_rootdse_done(struct tevent_req *subreq)
+     }
+ 
+     if (num_results == 0 || !results) {
+-        DEBUG(2, ("No RootDSE for server ?!\n"));
++        DEBUG(2, ("RootDSE could not be retrieved. "
++                  "Please check that anonymous access to RootDSE is allowed\n"
++              ));
+         tevent_req_error(req, ENOENT);
+         return;
+     }
+diff --git a/src/providers/ldap/sdap_async_connection.c b/src/providers/ldap/sdap_async_connection.c
+index a0224a1c13feeacb738b0c8878817edbed625921..fd1cc8c72c99f754b27422ac1debccb8f75f2732 100644
+--- a/src/providers/ldap/sdap_async_connection.c
++++ b/src/providers/ldap/sdap_async_connection.c
+@@ -1052,8 +1052,20 @@ static void sdap_cli_rootdse_done(struct tevent_req *subreq)
+             return;
+         }
+ 
+-        tevent_req_error(req, ret);
+-        return;
++        else if (ret == ENOENT) {
++            /* RootDSE was not available on
++             * the server.
++             * Continue, and just assume that the
++             * features requested by the config
++             * work properly.
++             */
++            state->use_rootdse = false;
++        }
++
++        else {
++            tevent_req_error(req, ret);
++            return;
++        }
+     }
+ 
+     sasl_mech = dp_opt_get_string(state->opts->basic, SDAP_SASL_MECH);
+-- 
+1.7.0.1
+

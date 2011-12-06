@@ -1,0 +1,56 @@
+From 7d6b7aab01369b1c2c069f5fe45f39191d4e4df1 Mon Sep 17 00:00:00 2001
+From: Alexander Gordeev <lasaine@lvk.cs.msu.su>
+Date: Thu, 24 Jun 2010 16:18:13 +0400
+Subject: [PATCH 4/4] Add explicit requests for several operational attrs
+
+Operational attributes are not returned in searched requests unless
+explicitly requested according to RFC 4512 section 5.1. Therefore to
+get several standard attributes of root DSE we have to request for
+them. The requested attrs are:
+ - altServer
+ - namingContexts
+ - supportedControl
+ - supportedExtension
+ - supportedFeatures
+ - supportedLDAPVersion
+ - supportedSASLMechanisms
+
+Signed-off-by: Alexander Gordeev <lasaine@lvk.cs.msu.su>
+---
+ src/providers/ldap/sdap_async.c |   13 ++++++++++++-
+ 1 files changed, 12 insertions(+), 1 deletions(-)
+
+diff --git a/src/providers/ldap/sdap_async.c b/src/providers/ldap/sdap_async.c
+index 5c2e2e3e1a6baa8c3d26f38eb8594d3704a09953..18f2bc0c54344535c9ea97697142469e26ffe3c3 100644
+--- a/src/providers/ldap/sdap_async.c
++++ b/src/providers/ldap/sdap_async.c
+@@ -637,6 +637,17 @@ struct tevent_req *sdap_get_rootdse_send(TALLOC_CTX *memctx,
+ {
+     struct tevent_req *req, *subreq;
+     struct sdap_get_rootdse_state *state;
++    const char *attrs[] = {
++	    "*",
++	    "altServer",
++	    "namingContexts",
++	    "supportedControl",
++	    "supportedExtension",
++	    "supportedFeatures",
++	    "supportedLDAPVersion",
++	    "supportedSASLMechanisms",
++	    NULL
++    };
+ 
+     DEBUG(9, ("Getting rootdse\n"));
+ 
+@@ -650,7 +661,7 @@ struct tevent_req *sdap_get_rootdse_send(TALLOC_CTX *memctx,
+ 
+     subreq = sdap_get_generic_send(state, ev, opts, sh,
+                                    "", LDAP_SCOPE_BASE,
+-                                   "(objectclass=*)", NULL, NULL, 0);
++                                   "(objectclass=*)", attrs, NULL, 0);
+     if (!subreq) {
+         talloc_zfree(req);
+         return NULL;
+-- 
+1.7.0.1
+

@@ -1,0 +1,1428 @@
+From 504899ef4150fc7f5f3ab53abbb8df95dc6713d3 Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Fri, 23 Jul 2010 13:20:40 -0400
+Subject: [PATCH 7/7] Clean up initgroups processing for RFC2307
+
+Instead of recursively updating all users of each group the user
+being queried belongs to, just add or remove membership for the
+requested user.
+
+Resolves: rhbz#617623
+---
+ src/Makefile.am                          |   14 ++-
+ src/db/sysdb.c                           |   97 +++++++++++++
+ src/db/sysdb.h                           |   18 +++
+ src/db/sysdb_ops.c                       |  191 +++++++++++++++++++++++++
+ src/providers/ldap/sdap_async_accounts.c |  212 ++++++++++++++++++++++++++--
+ src/tests/sysdb-tests.c                  |  199 ++++++++++++++++++++++++++
+ src/tests/util-tests.c                   |  227 ++++++++++++++++++++++++++++++
+ src/util/util.c                          |  227 ++++++++++++++++++++++++++++++
+ src/util/util.h                          |   19 +++
+ 9 files changed, 1187 insertions(+), 17 deletions(-)
+ create mode 100644 src/tests/util-tests.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 8eea7ac2dd74ca3db86375c92f1ddfbccfa44a65..847e97ad374970e689073ad51c5d94d811e1f4ef 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -82,7 +82,8 @@ if HAVE_CHECK
+         find_uid-tests \
+         auth-tests \
+         ipa_ldap_opt-tests \
+-        simple_access-tests
++        simple_access-tests \
++        util-tests
+ endif
+ 
+ check_PROGRAMS = \
+@@ -678,6 +679,17 @@ simple_access_tests_LDADD = \
+     $(SSSD_LIBS) \
+     $(CHECK_LIBS)
+ 
++util_tests_SOURCES = \
++    tests/util-tests.c \
++    $(SSSD_UTIL_OBJ)
++util_tests_CFLAGS = \
++    $(AM_CFLAGS) \
++    $(CHECK_CFLAGS)
++util_tests_LDADD = \
++    $(SSSD_LIBS) \
++    $(CHECK_LIBS) \
++    libsss_test_common.la
++
+ endif
+ 
+ stress_tests_SOURCES = \
+diff --git a/src/db/sysdb.c b/src/db/sysdb.c
+index 41e1756c97d346a96003fd679962c2c6937a3e0c..f6996c4310857a0bb4b1eaa78874293e728d9490 100644
+--- a/src/db/sysdb.c
++++ b/src/db/sysdb.c
+@@ -52,6 +52,28 @@ struct ldb_dn *sysdb_group_dn(struct sysdb_ctx *ctx, void *memctx,
+     return ldb_dn_new_fmt(memctx, ctx->ldb, SYSDB_TMPL_GROUP, name, domain);
+ }
+ 
++errno_t sysdb_group_dn_name(struct sysdb_ctx *ctx, void *memctx,
++                            const char *_dn, char **_name)
++{
++    struct ldb_dn *dn;
++    *_name = NULL;
++
++    dn = ldb_dn_new_fmt(memctx, ctx->ldb, "%s", _dn);
++    if (dn == NULL) {
++        return ENOMEM;
++    }
++
++    *_name = talloc_strdup(memctx, ldb_dn_get_rdn_name(dn));
++    if (!_name) {
++        talloc_zfree(dn);
++        return ENOMEM;
++    }
++
++    talloc_zfree(dn);
++
++    return EOK;
++}
++
+ struct ldb_dn *sysdb_domain_dn(struct sysdb_ctx *ctx, void *memctx,
+                               const char *domain)
+ {
+@@ -1924,3 +1946,78 @@ int sysdb_attrs_replace_name(struct sysdb_attrs *attrs, const char *oldname,
+ 
+     return EOK;
+ }
++
++/* Search for all incidences of attr_name in a list of
++ * sysdb_attrs and add their value to a list
++ *
++ * TODO: Currently only works for single-valued
++ * attributes. Multi-valued attributes will return
++ * only the first entry
++ */
++errno_t sysdb_attrs_to_list(TALLOC_CTX *memctx,
++                            struct sysdb_attrs **attrs,
++                            int attr_count,
++                            const char *attr_name,
++                            char ***_list)
++{
++    int attr_idx;
++    int i;
++    char **list;
++    char **tmp_list;
++    int list_idx;
++
++    *_list = NULL;
++
++    /* Assume that every attrs entry contains the attr_name
++     * This may waste a little memory if some entries don't
++     * have the attribute, but it will save us the trouble
++     * of continuously resizing the array.
++     */
++    list = talloc_array(memctx, char *, attr_count+1);
++    if (!list) {
++        return ENOMEM;
++    }
++
++    list_idx = 0;
++    /* Loop through all entries in attrs */
++    for (attr_idx = 0; attr_idx < attr_count; attr_idx++) {
++        /* Examine each attribute within the entry */
++        for (i = 0; i < attrs[attr_idx]->num; i++) {
++            if (strcasecmp(attrs[attr_idx]->a->name, attr_name) == 0) {
++                /* Attribute name matches the requested name
++                 * Copy it to the output list
++                 */
++                list[list_idx] = talloc_strdup(
++                        list,
++                        (const char *)attrs[attr_idx]->a->values[0].data);
++                if (!list[list_idx]) {
++                    talloc_free(list);
++                    return ENOMEM;
++                }
++                list_idx++;
++
++                /* We only support single-valued attributes
++                 * Break here and go on to the next entry
++                 */
++                break;
++            }
++        }
++    }
++
++    list[list_idx] = NULL;
++
++    /* if list_idx < attr_count, do a realloc to
++     * reclaim unused memory
++     */
++    if (list_idx < attr_count) {
++        tmp_list = talloc_realloc(memctx, list, char *, list_idx+1);
++        if (!tmp_list) {
++            talloc_zfree(list);
++            return ENOMEM;
++        }
++        list = tmp_list;
++    }
++
++    *_list = list;
++    return EOK;
++}
+diff --git a/src/db/sysdb.h b/src/db/sysdb.h
+index 50427d613241592badb62f2b093cc5301479522b..04ce49e66c3d056b8b4a81375674816d9a91cc3e 100644
+--- a/src/db/sysdb.h
++++ b/src/db/sysdb.h
+@@ -200,6 +200,8 @@ struct ldb_dn *sysdb_user_dn(struct sysdb_ctx *ctx, void *memctx,
+                              const char *domain, const char *name);
+ struct ldb_dn *sysdb_group_dn(struct sysdb_ctx *ctx, void *memctx,
+                               const char *domain, const char *name);
++errno_t sysdb_group_dn_name(struct sysdb_ctx *ctx, void *memctx,
++                            const char *dn_str, char **name);
+ struct ldb_dn *sysdb_domain_dn(struct sysdb_ctx *ctx, void *memctx,
+                                const char *domain);
+ struct ldb_dn *sysdb_custom_dn(struct sysdb_ctx *ctx, void *memctx,
+@@ -535,6 +537,16 @@ struct tevent_req *sysdb_remove_group_member_send(TALLOC_CTX *mem_ctx,
+                                                   const char *member);
+ int sysdb_remove_group_member_recv(struct tevent_req *req);
+ 
++
++struct tevent_req * sysdb_update_members_send(TALLOC_CTX *mem_ctx,
++                                              struct tevent_context *ev,
++                                              struct sysdb_handle *handle,
++                                              struct sss_domain_info *domain,
++                                              char *user,
++                                              char **add_groups,
++                                              char **del_groups);
++errno_t sysdb_update_members_recv(struct tevent_req *req);
++
+ /* Password caching function.
+  * If you are in a transaction ignore sysdb and pass in the handle.
+  * If you are not in a transaction pass NULL in handle and provide sysdb,
+@@ -652,4 +664,10 @@ struct tevent_req *sysdb_delete_group_send(TALLOC_CTX *mem_ctx,
+                                            const char *name, gid_t gid);
+ int sysdb_delete_group_recv(struct tevent_req *req);
+ 
++errno_t sysdb_attrs_to_list(TALLOC_CTX *memctx,
++                            struct sysdb_attrs **attrs,
++                            int attr_count,
++                            const char *attr_name,
++                            char ***_list);
++
+ #endif /* __SYS_DB_H__ */
+diff --git a/src/db/sysdb_ops.c b/src/db/sysdb_ops.c
+index 6fcc95b19223ae9ee029519f54da524f16514c28..52102706c494e29c6cdda6fb9677d45226cfec04 100644
+--- a/src/db/sysdb_ops.c
++++ b/src/db/sysdb_ops.c
+@@ -5065,3 +5065,194 @@ int sysdb_cache_auth_recv(struct tevent_req *req, time_t *expire_date,
+ 
+     return (state->authentication_successful ? EOK : EINVAL);
+ }
++
++struct sysdb_update_members_ctx {
++    char *user;
++    struct sss_domain_info *domain;
++    struct tevent_context *ev;
++    struct sysdb_handle *handle;
++
++    char **add_groups;
++    int add_group_iter;
++
++    char **del_groups;
++    int del_group_iter;
++};
++
++static char **empty_string_list(TALLOC_CTX *mem_ctx)
++{
++    char **empty;
++    empty = talloc_array(mem_ctx, char *, 1);
++    if (!empty) {
++        return NULL;
++    }
++
++    empty[0] = NULL;
++
++    return empty;
++}
++
++static errno_t
++sysdb_update_members_step(struct tevent_req *req);
++
++struct tevent_req *sysdb_update_members_send(TALLOC_CTX *mem_ctx,
++                                             struct tevent_context *ev,
++                                             struct sysdb_handle *handle,
++                                             struct sss_domain_info *domain,
++                                             char *user,
++                                             char **add_groups,
++                                             char **del_groups)
++{
++    errno_t ret;
++    struct tevent_req *req;
++    struct sysdb_update_members_ctx *state;
++
++    req = tevent_req_create(mem_ctx, &state, struct sysdb_update_members_ctx);
++    if (!req) {
++        return NULL;
++    }
++
++    state->user = talloc_strdup(state, user);
++    if (!state->user) {
++        goto error;
++    }
++
++    state->domain = domain;
++    state->ev = ev;
++    state->handle = handle;
++
++    if (add_groups) {
++        state->add_groups = dup_string_list(state, (const char**)add_groups);
++    }
++    else {
++        state->add_groups = empty_string_list(state);
++    }
++    if (!state->add_groups) {
++        goto error;
++    }
++    state->add_group_iter = 0;
++
++    if (del_groups) {
++        state->del_groups = dup_string_list(state, (const char **)del_groups);
++    }
++    else {
++        state->del_groups = empty_string_list(state);
++    }
++    if (!state->del_groups) {
++        goto error;
++    }
++    state->del_group_iter = 0;
++
++    ret = sysdb_update_members_step(req);
++    if (ret != EOK) {
++        /* Nothing to do. Finish up */
++        tevent_req_error(req, ret);
++        tevent_req_post(req, state->ev);
++    }
++
++    return req;
++
++error:
++    talloc_free(req);
++    return NULL;
++}
++
++static void
++sysdb_update_members_add_done(struct tevent_req *subreq);
++static void
++sysdb_update_members_del_done(struct tevent_req *subreq);
++
++static errno_t
++sysdb_update_members_step(struct tevent_req *req)
++{
++    struct tevent_req *subreq;
++    struct sysdb_update_members_ctx *state;
++
++    state = tevent_req_data(req, struct sysdb_update_members_ctx);
++
++    if (state->add_groups[state->add_group_iter]) {
++        subreq = sysdb_add_group_member_send(
++                state, state->ev, state->handle,
++                state->domain,
++                state->add_groups[state->add_group_iter],
++                state->user);
++        if (!subreq) {
++            return EIO;
++        }
++
++        tevent_req_set_callback(subreq, sysdb_update_members_add_done, req);
++        return EOK;
++    }
++
++    if (state->del_groups[state->del_group_iter]) {
++        subreq = sysdb_remove_group_member_send(
++                state, state->ev,
++                state->handle, state->domain,
++                state->del_groups[state->del_group_iter],
++                state->user);
++        if (!subreq) {
++            return EIO;
++        }
++
++        tevent_req_set_callback(subreq, sysdb_update_members_del_done, req);
++        return EOK;
++    }
++
++    /* No more members to handle */
++    tevent_req_done(req);
++    return EOK;
++}
++
++static void
++sysdb_update_members_add_done(struct tevent_req *subreq)
++{
++    errno_t ret;
++    struct tevent_req *req =
++            tevent_req_callback_data(subreq, struct tevent_req);
++    struct sysdb_update_members_ctx *state =
++            tevent_req_data(req, struct sysdb_update_members_ctx);
++
++    ret = sysdb_add_group_member_recv(subreq);
++    talloc_zfree(subreq);
++    if(ret != EOK) {
++        tevent_req_error(req, ret);
++        return;
++    }
++
++    state->add_group_iter++;
++    ret = sysdb_update_members_step(req);
++    if (ret != EOK) {
++        tevent_req_error(req, ret);
++        return;
++    }
++}
++
++static void
++sysdb_update_members_del_done(struct tevent_req *subreq)
++{
++    errno_t ret;
++    struct tevent_req *req =
++            tevent_req_callback_data(subreq, struct tevent_req);
++    struct sysdb_update_members_ctx *state =
++            tevent_req_data(req, struct sysdb_update_members_ctx);
++
++    ret = sysdb_remove_group_member_recv(subreq);
++    talloc_zfree(subreq);
++    if(ret != EOK) {
++        tevent_req_error(req, ret);
++        return;
++    }
++
++    state->del_group_iter++;
++    ret = sysdb_update_members_step(req);
++    if (ret != EOK) {
++        tevent_req_error(req, ret);
++        return;
++    }
++}
++
++errno_t
++sysdb_update_members_recv(struct tevent_req *req)
++{
++    return sysdb_op_default_recv(req);
++}
+diff --git a/src/providers/ldap/sdap_async_accounts.c b/src/providers/ldap/sdap_async_accounts.c
+index 384936db400c264b792b55cfd775880cbdc4f2e9..beab326a05fe429a56d4eee78590ed78a58279c8 100644
+--- a/src/providers/ldap/sdap_async_accounts.c
++++ b/src/providers/ldap/sdap_async_accounts.c
+@@ -1485,12 +1485,17 @@ struct sdap_initgr_rfc2307_state {
+     struct sdap_options *opts;
+     struct sss_domain_info *dom;
+     struct sdap_handle *sh;
++    char *name;
++
++    struct sysdb_handle *handle;
++    char **ldap_grouplist;
+ 
+     struct sdap_op *op;
+ };
+ 
+ static void sdap_initgr_rfc2307_process(struct tevent_req *subreq);
+-static void sdap_initgr_rfc2307_done(struct tevent_req *subreq);
++
++static
+ struct tevent_req *sdap_initgr_rfc2307_send(TALLOC_CTX *memctx,
+                                             struct tevent_context *ev,
+                                             struct sdap_options *opts,
+@@ -1498,12 +1503,12 @@ struct tevent_req *sdap_initgr_rfc2307_send(TALLOC_CTX *memctx,
+                                             struct sss_domain_info *dom,
+                                             struct sdap_handle *sh,
+                                             const char *base_dn,
+-                                            const char *name,
+-                                            const char **grp_attrs)
++                                            const char *name)
+ {
+     struct tevent_req *req, *subreq;
+     struct sdap_initgr_rfc2307_state *state;
+     const char *filter;
++    const char *attrs[2];
+ 
+     req = tevent_req_create(memctx, &state, struct sdap_initgr_rfc2307_state);
+     if (!req) return NULL;
+@@ -1514,6 +1519,18 @@ struct tevent_req *sdap_initgr_rfc2307_send(TALLOC_CTX *memctx,
+     state->dom = dom;
+     state->sh = sh;
+     state->op = NULL;
++    state->name = talloc_strdup(state, name);
++    if (!state->name) {
++        talloc_zfree(req);
++        return NULL;
++    }
++
++    attrs[0] = talloc_strdup(state, opts->group_map[SDAP_AT_GROUP_NAME].name);
++    if (!attrs[0]) {
++        talloc_zfree(req);
++        return NULL;
++    }
++    attrs[1] = NULL;
+ 
+     filter = talloc_asprintf(state, "(&(%s=%s)(objectclass=%s))",
+                              opts->group_map[SDAP_AT_GROUP_MEMBER].name,
+@@ -1525,7 +1542,7 @@ struct tevent_req *sdap_initgr_rfc2307_send(TALLOC_CTX *memctx,
+ 
+     subreq = sdap_get_generic_send(state, state->ev, state->opts,
+                                    state->sh, base_dn, LDAP_SCOPE_SUBTREE,
+-                                   filter, grp_attrs,
++                                   filter, attrs,
+                                    state->opts->group_map, SDAP_OPTS_GROUP);
+     if (!subreq) {
+         talloc_zfree(req);
+@@ -1536,6 +1553,7 @@ struct tevent_req *sdap_initgr_rfc2307_send(TALLOC_CTX *memctx,
+     return req;
+ }
+ 
++static void sdap_initgr_rfc2307_get_sysdb_groups(struct tevent_req *subreq);
+ static void sdap_initgr_rfc2307_process(struct tevent_req *subreq)
+ {
+     struct tevent_req *req;
+@@ -1555,34 +1573,196 @@ static void sdap_initgr_rfc2307_process(struct tevent_req *subreq)
+     }
+ 
+     if (count == 0) {
++        /* No groups for this user in LDAP
++         * We need to ensure that there are no groups
++         * in the sysdb either.
++         */
++
++        state->ldap_grouplist = NULL;
++    }
++    else {
++        ret = sysdb_attrs_to_list(state, groups, count,
++                                  state->opts->group_map[SDAP_AT_GROUP_NAME].name,
++                                  &state->ldap_grouplist);
++        if (ret != EOK) {
++            tevent_req_error(req, ret);
++            return;
++        }
++    }
++    /* Start a transaction to look up the groups in the sysdb
++     * and update them with LDAP data
++     */
++
++    subreq = sysdb_transaction_send(state, state->ev, state->sysdb);
++    if (!subreq) {
++        tevent_req_error(req, EIO);
++        return;
++    }
++    tevent_req_set_callback(subreq,
++                            sdap_initgr_rfc2307_get_sysdb_groups,
++                            req);
++}
++
++static void sdap_initgr_rfc2307_update_sysdb_groups(struct tevent_req *subreq);
++static void sdap_initgr_rfc2307_get_sysdb_groups(struct tevent_req *subreq)
++{
++    struct tevent_req *req =
++            tevent_req_callback_data(subreq, struct tevent_req);
++    struct sdap_initgr_rfc2307_state *state =
++            tevent_req_data(req, struct sdap_initgr_rfc2307_state);
++    int ret;
++    const char **attrs;
++
++    ret = sysdb_transaction_recv(subreq, state, &state->handle);
++    talloc_zfree(subreq);
++    if (ret) {
++        tevent_req_error(req, ret);
++        return;
++    }
++
++    attrs = talloc_array(state, const char *, 2);
++    if (!attrs) {
++        tevent_req_error(req, ENOMEM);
++        return;
++    }
++    attrs[0] = SYSDB_MEMBEROF;
++    attrs[1] = NULL;
++
++    /* Search for all groups for which this user is a member */
++    subreq = sysdb_search_user_by_name_send(state, state->ev, state->sysdb,
++                                            state->handle, state->dom,
++                                            state->name, attrs);
++    if (!subreq) {
++        tevent_req_error(req, EIO);
++        return;
++    }
++
++    tevent_req_set_callback(subreq,
++                            sdap_initgr_rfc2307_update_sysdb_groups,
++                            req);
++}
++
++static void
++sdap_initgr_rfc2307_update_sysdb_groups_done(struct tevent_req *subreq);
++static void sdap_initgr_rfc2307_update_sysdb_groups(struct tevent_req *subreq)
++{
++    struct tevent_req *req =
++            tevent_req_callback_data(subreq, struct tevent_req);
++    struct sdap_initgr_rfc2307_state *state =
++            tevent_req_data(req, struct sdap_initgr_rfc2307_state);
++    int ret, i;
++    struct ldb_message *reply;
++    struct ldb_message_element *groups;
++    char **sysdb_grouplist;
++    char **add_groups;
++    char **del_groups;
++
++    ret = sysdb_search_user_recv(subreq, state, &reply);
++    talloc_zfree(subreq);
++    if (ret) {
++        tevent_req_error(req, ret);
++        return;
++    }
++
++    groups = ldb_msg_find_element(reply, SYSDB_MEMBEROF);
++    if (!groups || groups->num_values == 0) {
++        DEBUG(6, ("User is not a member of any groups\n"));
++
+         tevent_req_done(req);
+         return;
+     }
+ 
+-    subreq = sdap_save_groups_send(state, state->ev, state->dom,
+-                                   state->sysdb, state->opts,
+-                                   groups, count);
+-    if (!subreq) {
++    sysdb_grouplist = talloc_array(state, char *,
++                                          groups->num_values+1);
++    if (!sysdb_grouplist) {
+         tevent_req_error(req, ENOMEM);
+         return;
+     }
+-    tevent_req_set_callback(subreq, sdap_initgr_rfc2307_done, req);
++
++    /* Get a list of the groups by groupname only */
++    for (i=0; i < groups->num_values; i++) {
++         ret = sysdb_group_dn_name(state->sysdb,
++                                   sysdb_grouplist,
++                                   (const char *)groups->values[i].data,
++                                   &sysdb_grouplist[i]);
++         if (ret != EOK) {
++             tevent_req_error(req, ENOMEM);
++             return;
++         }
++    }
++
++    sysdb_grouplist[groups->num_values] = NULL;
++
++    /* Find the differences between the sysdb and ldap lists
++     * Groups in ldap only must be added to the sysdb;
++     * groups in the sysdb only must be removed.
++     */
++    ret = diff_string_lists(state,
++                            state->ldap_grouplist, sysdb_grouplist,
++                            &add_groups, &del_groups, NULL);
++    if (ret != EOK) {
++        tevent_req_error(req, ret);
++        return;
++    }
++
++    subreq = sysdb_update_members_send(state, state->ev, state->handle,
++                                       state->dom, state->name,
++                                       add_groups, del_groups);
++    if (!subreq) {
++        tevent_req_error(req, EIO);
++        return;
++    }
++
++    tevent_req_set_callback(subreq,
++                            sdap_initgr_rfc2307_update_sysdb_groups_done,
++                            req);
+ }
+ 
+-static void sdap_initgr_rfc2307_done(struct tevent_req *subreq)
++static void
++sdap_initgr_rfc2307_transaction_done(struct tevent_req *subreq);
++static void
++sdap_initgr_rfc2307_update_sysdb_groups_done(struct tevent_req *subreq)
+ {
+-    struct tevent_req *req;
+-    int ret;
++    errno_t ret;
++    struct tevent_req *req =
++            tevent_req_callback_data(subreq, struct tevent_req);
++    struct sdap_initgr_rfc2307_state *state =
++            tevent_req_data(req, struct sdap_initgr_rfc2307_state);
+ 
+-    req = tevent_req_callback_data(subreq, struct tevent_req);
++    ret = sysdb_update_members_recv(subreq);
++    talloc_zfree(subreq);
++    if (ret != EOK) {
++        tevent_req_error(req, ret);
++        return;
++    }
++
++    /* Commit the transaction */
++    subreq = sysdb_transaction_commit_send(state, state->ev, state->handle);
++    if (!subreq) {
++        tevent_req_error(req, EIO);
++        return;
++    }
++
++    tevent_req_set_callback(subreq,
++                            sdap_initgr_rfc2307_transaction_done,
++                            req);
++}
++
++static void
++sdap_initgr_rfc2307_transaction_done(struct tevent_req *subreq)
++{
++    errno_t ret;
++    struct tevent_req *req =
++            tevent_req_callback_data(subreq, struct tevent_req);
+ 
+-    ret = sdap_save_groups_recv(subreq, NULL, NULL);
++    ret = sysdb_transaction_commit_recv(subreq);
+     talloc_zfree(subreq);
+-    if (ret) {
++    if (ret != EOK) {
+         tevent_req_error(req, ret);
+         return;
+     }
+ 
++    /* Processing completed. Return control to sdap_get_initgr_done() */
+     tevent_req_done(req);
+ }
+ 
+@@ -1988,7 +2168,7 @@ static void sdap_get_initgr_process(struct tevent_req *subreq)
+                                     state->sysdb, state->dom, state->sh,
+                                     dp_opt_get_string(state->opts->basic,
+                                                   SDAP_GROUP_SEARCH_BASE),
+-                                    state->name, state->grp_attrs);
++                                    state->name);
+         if (!subreq) {
+             tevent_req_error(req, ENOMEM);
+             return;
+diff --git a/src/tests/sysdb-tests.c b/src/tests/sysdb-tests.c
+index 8557be5ad126adec06b1605b0708c3d6ac6d5e19..5bdc005473041243b254461dc3931ee30ba0afd0 100644
+--- a/src/tests/sysdb-tests.c
++++ b/src/tests/sysdb-tests.c
+@@ -3124,6 +3124,200 @@ START_TEST (test_sysdb_memberof_check_memberuid_loop_without_group_5)
+ }
+ END_TEST
+ 
++START_TEST (test_sysdb_attrs_to_list)
++{
++    struct sysdb_attrs *attrs_list[3];
++    char **list;
++    errno_t ret;
++
++    TALLOC_CTX *test_ctx = talloc_new(NULL);
++
++    attrs_list[0] = sysdb_new_attrs(test_ctx);
++    sysdb_attrs_add_string(attrs_list[0], "test_attr", "attr1");
++    attrs_list[1] = sysdb_new_attrs(test_ctx);
++    sysdb_attrs_add_string(attrs_list[1], "test_attr", "attr2");
++    attrs_list[2] = sysdb_new_attrs(test_ctx);
++    sysdb_attrs_add_string(attrs_list[2], "nottest_attr", "attr3");
++
++    ret = sysdb_attrs_to_list(test_ctx, attrs_list, 3,
++                              "test_attr", &list);
++    fail_unless(ret == EOK, "sysdb_attrs_to_list failed with code %d", ret);
++
++    fail_unless(strcmp(list[0],"attr1") == 0, "Expected [attr1], got [%s]",
++                                              list[0]);
++    fail_unless(strcmp(list[1],"attr2") == 0, "Expected [attr2], got [%s]",
++                                              list[1]);
++    fail_unless(list[2] == NULL, "List should be NULL-terminated");
++
++    talloc_free(test_ctx);
++}
++END_TEST
++
++static void test_sysdb_update_members_add(struct tevent_req *req);
++START_TEST (test_sysdb_update_members)
++{
++    struct sysdb_test_ctx *test_ctx;
++    struct test_data *data;
++    struct tevent_req *req;
++    int ret;
++
++    /* Setup */
++    ret = setup_sysdb_tests(&test_ctx);
++    if (ret != EOK) {
++        fail("Could not set up the test");
++        return;
++    }
++
++    data = talloc_zero(test_ctx, struct test_data);
++    data->ctx = test_ctx;
++    data->ev = test_ctx->ev;
++
++    /* Start the transaction */
++    req = sysdb_transaction_send(data, data->ev, test_ctx->sysdb);
++    if (!req) {
++        ret = ENOMEM;
++    }
++
++    if (ret == EOK) {
++        tevent_req_set_callback(req, test_sysdb_update_members_add, data);
++
++        ret = test_loop(data);
++    }
++
++    fail_if(ret != EOK, "Could not test sysdb_update_members");
++    talloc_free(test_ctx);
++}
++END_TEST
++
++static void test_sysdb_update_members_add_del(struct tevent_req *req);
++static void test_sysdb_update_members_add(struct tevent_req *req)
++{
++    struct test_data *data = tevent_req_callback_data(req, struct test_data);
++    char **add_groups;
++    char *user;
++    errno_t ret;
++
++    ret = sysdb_transaction_recv(req, data, &data->handle);
++    talloc_zfree(req);
++    if (ret != EOK) {
++        DEBUG(0, ("Could not start transaction\n"));
++        test_return(data, ret);
++        return;
++    }
++
++    /* Add a user to two groups */
++    data->username = talloc_strdup(data, "testuser27000");
++    user = talloc_strdup(data, data->username);
++    add_groups = talloc_array(data, char *, 3);
++    add_groups[0] = talloc_strdup(data, "testgroup28001");
++    add_groups[1] = talloc_strdup(data, "testgroup28002");
++    add_groups[2] = NULL;
++
++    req = sysdb_update_members_send(data, data->ev, data->handle,
++                                    data->ctx->domain, user,
++                                    add_groups, NULL);
++    talloc_free(add_groups);
++    talloc_free(user);
++    if (!req) {
++        DEBUG(0, ("Could not add groups\n"));
++        test_return(data, EIO);
++        return;
++    }
++
++    tevent_req_set_callback(req, test_sysdb_update_members_add_del, data);
++}
++
++static void test_sysdb_update_members_del(struct tevent_req *req);
++static void test_sysdb_update_members_add_del(struct tevent_req *req)
++{
++    struct test_data *data = tevent_req_callback_data(req, struct test_data);
++    errno_t ret;
++    char **add_groups = NULL;
++    char **del_groups = NULL;
++    char *user;
++
++    ret = sysdb_update_members_recv(req);
++    talloc_zfree(req);
++    if (ret != EOK) {
++        DEBUG(0, ("Group addition failed [%d](%s)\n", ret, strerror(ret)));
++        test_return(data, ret);
++        return;
++    }
++
++    /* Remove a user from one group and add to another */
++    user = talloc_strdup(data, data->username);
++    del_groups = talloc_array(data, char *, 2);
++    del_groups[0] = talloc_strdup(del_groups, "testgroup28001");
++    del_groups[1] = NULL;
++    add_groups = talloc_array(data, char *, 2);
++    add_groups[0] = talloc_strdup(add_groups, "testgroup28003");
++    add_groups[1] = NULL;
++
++    req = sysdb_update_members_send(data, data->ev, data->handle,
++                                    data->ctx->domain, user,
++                                    add_groups, del_groups);
++    talloc_free(add_groups);
++    talloc_free(del_groups);
++    talloc_free(user);
++    if (!req) {
++        DEBUG(0, ("Could not add/del groups\n"));
++        test_return(data, EIO);
++        return;
++    }
++
++    tevent_req_set_callback(req, test_sysdb_update_members_del, data);
++}
++
++static void test_sysdb_update_members_done(struct tevent_req *req);
++static void test_sysdb_update_members_del(struct tevent_req *req)
++{
++    struct test_data *data = tevent_req_callback_data(req, struct test_data);
++    errno_t ret;
++    char **del_groups = NULL;
++    char *user;
++
++    ret = sysdb_update_members_recv(req);
++    talloc_zfree(req);
++    if (ret != EOK) {
++        DEBUG(0, ("Group replace failed [%d](%s)\n", ret, strerror(ret)));
++        test_return(data, EIO);
++        return;
++    }
++
++    /* Remove a user from one group and add to another */
++    user = talloc_strdup(data, data->username);
++    del_groups = talloc_array(data, char *, 3);
++    del_groups[0] = talloc_strdup(del_groups, "testgroup28002");
++    del_groups[1] = talloc_strdup(del_groups, "testgroup28003");
++    del_groups[2] = NULL;
++
++    req = sysdb_update_members_send(data, data->ev, data->handle,
++                                    data->ctx->domain, user,
++                                    NULL, del_groups);
++    talloc_free(del_groups);
++    talloc_free(user);
++    if (!req) {
++        DEBUG(0, ("Could not del groups\n"));
++        test_return(data, EIO);
++        return;
++    }
++
++    tevent_req_set_callback(req, test_sysdb_update_members_done, data);
++}
++
++static void test_sysdb_update_members_done(struct tevent_req *req)
++{
++    struct test_data *data = tevent_req_callback_data(req, struct test_data);
++    errno_t ret;
++
++    ret = sysdb_update_members_recv(req);
++    talloc_zfree(req);
++    if (ret != EOK) {
++        DEBUG(0, ("Group delete failed [%d](%s)\n", ret, strerror(ret)));
++    }
++    test_return(data, ret);
++}
++
+ Suite *create_sysdb_suite(void)
+ {
+     Suite *s = suite_create("sysdb");
+@@ -3148,6 +3342,9 @@ Suite *create_sysdb_suite(void)
+     /* test the change */
+     tcase_add_loop_test(tc_sysdb, test_sysdb_get_user_attr, 27000, 27010);
+ 
++    /* Add and remove users in a group with sysdb_update_members */
++    tcase_add_test(tc_sysdb, test_sysdb_update_members);
++
+     /* Remove the other half by gid */
+     tcase_add_loop_test(tc_sysdb, test_sysdb_remove_local_group_by_gid, 28000, 28010);
+ 
+@@ -3233,6 +3430,8 @@ Suite *create_sysdb_suite(void)
+ 
+     tcase_add_test(tc_sysdb, test_sysdb_attrs_replace_name);
+ 
++    tcase_add_test(tc_sysdb, test_sysdb_attrs_to_list);
++
+ /* Add all test cases to the test suite */
+     suite_add_tcase(s, tc_sysdb);
+ 
+diff --git a/src/tests/util-tests.c b/src/tests/util-tests.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8d3800fd8c6b5b3e5725255e006922bed7ccb34
+--- /dev/null
++++ b/src/tests/util-tests.c
+@@ -0,0 +1,227 @@
++/*
++    SSSD
++
++    util-tests.c
++
++    Authors:
++        Stephen Gallagher <sgallagh@redhat.com>
++
++    Copyright (C) 2010 Red Hat
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include <popt.h>
++#include <talloc.h>
++#include <check.h>
++#include "util/util.h"
++#include "tests/common.h"
++
++START_TEST(test_diff_string_lists)
++{
++    TALLOC_CTX *test_ctx;
++    char **l1;
++    char **l2;
++    char **l3;
++    char **only_l1;
++    char **only_l2;
++    char **both;
++    int ret;
++
++    test_ctx = talloc_new(NULL);
++
++    /* Test with all values returned */
++    l1 = talloc_array(test_ctx, char *, 4);
++    l1[0] = talloc_strdup(l1, "a");
++    l1[1] = talloc_strdup(l1, "b");
++    l1[2] = talloc_strdup(l1, "c");
++    l1[3] = NULL;
++
++    l2 = talloc_array(test_ctx, char *, 4);
++    l2[0] = talloc_strdup(l1, "d");
++    l2[1] = talloc_strdup(l1, "c");
++    l2[2] = talloc_strdup(l1, "b");
++    l2[3] = NULL;
++
++    ret = diff_string_lists(test_ctx,
++                            l1, l2,
++                            &only_l1, &only_l2, &both);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(strcmp(only_l1[0], "a") == 0, "Missing \"a\" from only_l1");
++    fail_unless(only_l1[1] == NULL, "only_l1 not NULL-terminated");
++    fail_unless(strcmp(only_l2[0], "d") == 0, "Missing \"d\" from only_l2");
++    fail_unless(only_l2[1] == NULL, "only_l2 not NULL-terminated");
++    fail_unless(strcmp(both[0], "c") == 0, "Missing \"c\" from both");
++    fail_unless(strcmp(both[1], "b") == 0, "Missing \"b\" from both");
++    fail_unless(both[2] == NULL, "both not NULL-terminated");
++
++    talloc_zfree(only_l1);
++    talloc_zfree(only_l2);
++    talloc_zfree(both);
++
++    /* Test with restricted return values */
++    ret = diff_string_lists(test_ctx,
++                            l1, l2,
++                            &only_l1, &only_l2, NULL);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(strcmp(only_l1[0], "a") == 0, "Missing \"a\" from only_l1");
++    fail_unless(only_l1[1] == NULL, "only_l1 not NULL-terminated");
++    fail_unless(strcmp(only_l2[0], "d") == 0, "Missing \"d\" from only_l2");
++    fail_unless(only_l2[1] == NULL, "only_l2 not NULL-terminated");
++    fail_unless(both == NULL, "Nothing returned to both");
++
++    talloc_zfree(only_l1);
++    talloc_zfree(only_l2);
++    talloc_zfree(both);
++
++    ret = diff_string_lists(test_ctx,
++                            l1, l2,
++                            &only_l1, NULL, NULL);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(strcmp(only_l1[0], "a") == 0, "Missing \"a\" from only_l1");
++    fail_unless(only_l1[1] == NULL, "only_l1 not NULL-terminated");
++    fail_unless(only_l2 == NULL, "Nothing returned to only_l2");
++    fail_unless(both == NULL, "Nothing returned to both");
++
++    talloc_zfree(only_l1);
++    talloc_zfree(only_l2);
++    talloc_zfree(both);
++
++    ret = diff_string_lists(test_ctx,
++                            l1, l2,
++                            NULL, &only_l2, NULL);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(strcmp(only_l2[0], "d") == 0, "Missing \"d\" from only_l2");
++    fail_unless(only_l2[1] == NULL, "only_l2 not NULL-terminated");
++    fail_unless(only_l1 == NULL, "Nothing returned to only_l1");
++    fail_unless(both == NULL, "Nothing returned to both");
++
++    talloc_zfree(only_l1);
++    talloc_zfree(only_l2);
++    talloc_zfree(both);
++
++    /* Test with no overlap */
++    l3 = talloc_array(test_ctx, char *, 4);
++    l3[0] = talloc_strdup(l1, "d");
++    l3[1] = talloc_strdup(l1, "e");
++    l3[2] = talloc_strdup(l1, "f");
++    l3[3] = NULL;
++
++    ret = diff_string_lists(test_ctx,
++                            l1, l3,
++                            &only_l1, &only_l2, &both);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(strcmp(only_l1[0], "a") == 0, "Missing \"a\" from only_l1");
++    fail_unless(strcmp(only_l1[1], "b") == 0, "Missing \"b\" from only_l1");
++    fail_unless(strcmp(only_l1[2], "c") == 0, "Missing \"c\" from only_l1");
++    fail_unless(only_l1[3] == NULL, "only_l1 not NULL-terminated");
++    fail_unless(strcmp(only_l2[0], "d") == 0, "Missing \"f\" from only_l2");
++    fail_unless(strcmp(only_l2[1], "e") == 0, "Missing \"e\" from only_l2");
++    fail_unless(strcmp(only_l2[2], "f") == 0, "Missing \"d\" from only_l2");
++    fail_unless(only_l2[3] == NULL, "only_l2 not NULL-terminated");
++    fail_unless(both[0] == NULL, "both should have zero entries");
++
++    talloc_zfree(only_l1);
++    talloc_zfree(only_l2);
++    talloc_zfree(both);
++
++    /* Test with 100% overlap */
++    ret = diff_string_lists(test_ctx,
++                            l1, l1,
++                            &only_l1, &only_l2, &both);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(only_l1[0] == NULL, "only_l1 should have zero entries");
++    fail_unless(only_l2[0] == NULL, "only_l2 should have zero entries");
++    fail_unless(strcmp(both[0], "a") == 0, "Missing \"a\" from both");
++    fail_unless(strcmp(both[1], "b") == 0, "Missing \"b\" from both");
++    fail_unless(strcmp(both[2], "c") == 0, "Missing \"c\" from both");
++    fail_unless(both[3] == NULL, "both is not NULL-terminated");
++
++    talloc_zfree(only_l1);
++    talloc_zfree(only_l2);
++    talloc_zfree(both);
++
++    /* Test with no second list */
++    ret = diff_string_lists(test_ctx,
++                            l1, NULL,
++                            &only_l1, &only_l2, &both);
++
++    fail_unless(ret == EOK, "diff_string_lists returned error [%d]", ret);
++    fail_unless(strcmp(only_l1[0], "a") == 0, "Missing \"a\" from only_l1");
++    fail_unless(strcmp(only_l1[1], "b") == 0, "Missing \"b\" from only_l1");
++    fail_unless(strcmp(only_l1[2], "c") == 0, "Missing \"c\" from only_l1");
++    fail_unless(only_l1[3] == NULL, "only_l1 not NULL-terminated");
++    fail_unless(only_l2[0] == NULL, "only_l2 should have zero entries");
++    fail_unless(both[0] == NULL, "both should have zero entries");
++
++    talloc_free(test_ctx);
++}
++END_TEST
++
++Suite *util_suite(void)
++{
++    Suite *s = suite_create("util");
++
++    TCase *tc_util = tcase_create("util");
++
++    tcase_add_test (tc_util, test_diff_string_lists);
++    tcase_set_timeout(tc_util, 60);
++
++    suite_add_tcase (s, tc_util);
++
++    return s;
++}
++
++int main(int argc, const char *argv[])
++{
++    int opt;
++    int failure_count;
++    poptContext pc;
++    Suite *s = util_suite();
++    SRunner *sr = srunner_create (s);
++
++    struct poptOption long_options[] = {
++        POPT_AUTOHELP
++        SSSD_MAIN_OPTS
++        { NULL }
++    };
++
++    pc = poptGetContext(argv[0], argc, argv, long_options, 0);
++    while((opt = poptGetNextOpt(pc)) != -1) {
++        switch(opt) {
++        default:
++            fprintf(stderr, "\nInvalid option %s: %s\n\n",
++                    poptBadOption(pc, 0), poptStrerror(opt));
++            poptPrintUsage(pc, stderr, 0);
++            return 1;
++        }
++    }
++    poptFreeContext(pc);
++
++    tests_set_cwd();
++
++    srunner_run_all(sr, CK_ENV);
++    failure_count = srunner_ntests_failed (sr);
++    srunner_free (sr);
++    if (failure_count == 0) {
++        return EXIT_SUCCESS;
++    }
++    return  EXIT_FAILURE;
++}
+diff --git a/src/util/util.c b/src/util/util.c
+index 9a973122242bb814e370f9bb3c5b890dd4ebbc5b..10bfb647b898c2c3696bcc7dbb6559585c66bd8a 100644
+--- a/src/util/util.c
++++ b/src/util/util.c
+@@ -22,6 +22,7 @@
+ 
+ #include "talloc.h"
+ #include "util/util.h"
++#include "dhash.h"
+ 
+ /* split a string into an allocated array of strings.
+  * the separator is a string, and is case-sensitive.
+@@ -235,3 +236,229 @@ fail:
+     free_args(ret);
+     return NULL;
+ }
++
++char **dup_string_list(TALLOC_CTX *memctx, const char **str_list)
++{
++    int i = 0;
++    int j = 0;
++    char **dup_list;
++
++    if (!str_list) {
++        return NULL;
++    }
++
++    /* Find the size of the list */
++    while (str_list[i]) i++;
++
++    dup_list = talloc_array(memctx, char *, i+1);
++    if (!dup_list) {
++        return NULL;
++    }
++
++    /* Copy the elements */
++    for (j = 0; j < i; j++) {
++        dup_list[j] = talloc_strdup(dup_list, str_list[j]);
++        if (!dup_list[j]) {
++            talloc_free(dup_list);
++            return NULL;
++        }
++    }
++
++    /* NULL-terminate the list */
++    dup_list[i] = NULL;
++
++    return dup_list;
++}
++
++/* Take two string lists (terminated on a NULL char*)
++ * and return up to three arrays of strings based on
++ * shared ownership.
++ *
++ * Pass NULL to any return type you don't care about
++ */
++errno_t diff_string_lists(TALLOC_CTX *memctx,
++                          char **_list1,
++                          char **_list2,
++                          char ***_list1_only,
++                          char ***_list2_only,
++                          char ***_both_lists)
++{
++    int error;
++    errno_t ret;
++    int i;
++    int i2 = 0;
++    int i12 = 0;
++    hash_table_t *table;
++    hash_key_t key;
++    hash_value_t value;
++    char **list1 = NULL;
++    char **list2 = NULL;
++    char **list1_only = NULL;
++    char **list2_only = NULL;
++    char **both_lists = NULL;
++    unsigned long count;
++    hash_key_t *keys;
++
++    TALLOC_CTX *tmp_ctx = talloc_new(memctx);
++    if (!tmp_ctx) {
++        return ENOMEM;
++    }
++
++    if (!_list1) {
++        list1 = talloc_array(tmp_ctx, char *, 1);
++        if (!list1) {
++            talloc_free(tmp_ctx);
++            return ENOMEM;
++        }
++        list1[0] = NULL;
++    }
++    else {
++        list1 = _list1;
++    }
++
++    if (!_list2) {
++        list2 = talloc_array(tmp_ctx, char *, 1);
++        if (!list2) {
++            talloc_free(tmp_ctx);
++            return ENOMEM;
++        }
++        list2[0] = NULL;
++    }
++    else {
++        list2 = _list2;
++    }
++
++    error = hash_create(10, &table, NULL, NULL);
++    if (error != HASH_SUCCESS) {
++        talloc_free(tmp_ctx);
++        return EIO;
++    }
++
++    key.type = HASH_KEY_STRING;
++    value.type = HASH_VALUE_UNDEF;
++
++    /* Add all entries from list 1 into a hash table */
++    i = 0;
++    while (list1[i]) {
++        key.str = talloc_strdup(tmp_ctx, list1[i]);
++        error = hash_enter(table, &key, &value);
++        if (error != HASH_SUCCESS) {
++            ret = EIO;
++            goto done;
++        }
++        i++;
++    }
++
++    /* Iterate through list 2 and remove matching items */
++    i = 0;
++    while (list2[i]) {
++        key.str = talloc_strdup(tmp_ctx, list2[i]);
++        error = hash_delete(table, &key);
++        if (error == HASH_SUCCESS) {
++            if (_both_lists) {
++                /* String was present in both lists */
++                i12++;
++                both_lists = talloc_realloc(tmp_ctx, both_lists, char *, i12+1);
++                if (!both_lists) {
++                    ret = ENOMEM;
++                    goto done;
++                }
++                both_lists[i12-1] = talloc_strdup(both_lists, list2[i]);
++                if (!both_lists[i12-1]) {
++                    ret = ENOMEM;
++                    goto done;
++                }
++
++                both_lists[i12] = NULL;
++            }
++        }
++        else if (error == HASH_ERROR_KEY_NOT_FOUND) {
++            if (_list2_only) {
++                /* String was present only in list2 */
++                i2++;
++                list2_only = talloc_realloc(tmp_ctx, list2_only,
++                                            char *, i2+1);
++                if (!list2_only) {
++                    ret = ENOMEM;
++                    goto done;
++                }
++                list2_only[i2-1] = talloc_strdup(list2_only, list2[i]);
++                if (!list2_only[i2-1]) {
++                    ret = ENOMEM;
++                    goto done;
++                }
++
++                list2_only[i2] = NULL;
++            }
++        }
++        else {
++            /* An error occurred */
++            ret = EIO;
++            goto done;
++        }
++        i++;
++    }
++
++    /* Get the leftover entries in the hash table */
++    if (_list1_only) {
++        error = hash_keys(table, &count, &keys);
++        if (error != HASH_SUCCESS) {
++            ret = EIO;
++            goto done;
++        }
++
++        list1_only = talloc_array(tmp_ctx, char *, count+1);
++        if (!list1_only) {
++            ret = ENOMEM;
++            goto done;
++        }
++
++        for (i = 0; i < count; i++) {
++            list1_only[i] = talloc_strdup(list1_only, keys[i].str);
++            if (!list1_only[i]) {
++                ret = ENOMEM;
++                goto done;
++            }
++        }
++        list1_only[count] = NULL;
++
++        free(keys);
++
++        *_list1_only = talloc_steal(memctx, list1_only);
++    }
++
++    if (_list2_only) {
++        if (list2_only) {
++            *_list2_only = talloc_steal(memctx, list2_only);
++        }
++        else {
++            *_list2_only = talloc_array(memctx, char *, 1);
++            if (!(*_list2_only)) {
++                ret = ENOMEM;
++                goto done;
++            }
++            *_list2_only[0] = NULL;
++        }
++    }
++
++    if (_both_lists) {
++        if (both_lists) {
++            *_both_lists = talloc_steal(memctx, both_lists);
++        }
++        else {
++            *_both_lists = talloc_array(memctx, char *, 1);
++            if (!(*_both_lists)) {
++                ret = ENOMEM;
++                goto done;
++            }
++            *_both_lists[0] = NULL;
++        }
++    }
++
++    ret = EOK;
++
++done:
++    hash_destroy(table);
++    talloc_free(tmp_ctx);
++    return ret;
++}
+diff --git a/src/util/util.h b/src/util/util.h
+index 3c95f7a2005f0fe815628a6985536c6fced24ada..6bcc9984db06592e3c9092842feab5f5fdbcadbf 100644
+--- a/src/util/util.h
++++ b/src/util/util.h
+@@ -331,4 +331,23 @@ int split_on_separator(TALLOC_CTX *mem_ctx, const char *str,
+                        const char sep, bool trim, char ***_list, int *size);
+ 
+ char **parse_args(const char *str);
++
++
++/* Copy a NULL-terminated string list
++ * Returns NULL on out of memory error or invalid input
++ */
++char **dup_string_list(TALLOC_CTX *memctx, const char **str_list);
++
++/* Take two string lists (terminated on a NULL char*)
++ * and return up to three arrays of strings based on
++ * shared ownership.
++ *
++ * Pass NULL to any return type you don't care about
++ */
++errno_t diff_string_lists(TALLOC_CTX *memctx,
++                          char **string1,
++                          char **string2,
++                          char ***string1_only,
++                          char ***string2_only,
++                          char ***both_strings);
+ #endif /* __SSSD_UTIL_H__ */
+-- 
+1.7.2
+

@@ -1,0 +1,222 @@
+From 9cb35bdb61898024cf6ba35982ef71cbbc257acb Mon Sep 17 00:00:00 2001
+From: Dmitri Pal <dpal@redhat.com>
+Date: Sat, 19 Jun 2010 11:18:42 -0400
+Subject: [PATCH 1/2] Fixing types in queue and stack interfaces
+
+---
+ common/collection/Makefile.am        |    2 +-
+ common/collection/collection_queue.c |    8 ++++----
+ common/collection/collection_queue.h |    8 ++++----
+ common/collection/collection_stack.c |    8 ++++----
+ common/collection/collection_stack.h |    8 ++++----
+ common/collection/configure.ac       |    2 +-
+ contrib/sssd.spec.in                 |    5 ++---
+ 7 files changed, 20 insertions(+), 21 deletions(-)
+
+diff --git a/common/collection/Makefile.am b/common/collection/Makefile.am
+index b9975d1866b7b2dde78906da6616f00cd0c37cbe..4e90aed12a2ff877fdeaa80b58de556ff2ed4706 100644
+--- a/common/collection/Makefile.am
++++ b/common/collection/Makefile.am
+@@ -41,7 +41,7 @@ libcollection_la_SOURCES = \
+     collection_priv.h \
+     ../trace/trace.h
+ libcollection_la_LDFLAGS = \
+-    -version-info 1:0:0
++    -version-info 2:0:0
+ 
+ # Build unit test
+ check_PROGRAMS = collection_ut collection_stack_ut collection_queue_ut
+diff --git a/common/collection/collection_queue.c b/common/collection/collection_queue.c
+index 7e068339027ab47e6fb9c3804537ea243a6425a6..adac8ee672a7a9c8c85eaa6c375040cbbe3c6ade 100644
+--- a/common/collection/collection_queue.c
++++ b/common/collection/collection_queue.c
+@@ -108,7 +108,7 @@ int col_enqueue_binary_property(struct collection_item *queue,
+ /* Put an int property into a queue. */
+ int col_enqueue_int_property(struct collection_item *queue,
+                              const char *property,
+-                             int number)
++                             int32_t number)
+ {
+     int error = EOK;
+ 
+@@ -135,7 +135,7 @@ int col_enqueue_int_property(struct collection_item *queue,
+ /* Put an unsigned int property into a queue. */
+ int col_enqueue_unsigned_property(struct collection_item *queue,
+                                   const char *property,
+-                                  unsigned int number)
++                                  uint32_t number)
+ {
+     int error = EOK;
+ 
+@@ -163,7 +163,7 @@ int col_enqueue_unsigned_property(struct collection_item *queue,
+ /* Put a long property. */
+ int col_enqueue_long_property(struct collection_item *queue,
+                               const char *property,
+-                              long number)
++                              int64_t number)
+ {
+     int error = EOK;
+ 
+@@ -190,7 +190,7 @@ int col_enqueue_long_property(struct collection_item *queue,
+ /* Put an unsigned long property. */
+ int col_enqueue_ulong_property(struct collection_item *queue,
+                                const char *property,
+-                               unsigned long number)
++                               uint64_t number)
+ {
+     int error = EOK;
+ 
+diff --git a/common/collection/collection_queue.h b/common/collection/collection_queue.h
+index 2fe07489fd6f20d89ba804c81993f5db9e6cf4a9..86c392523d0fe36781fdce0c17d6cda88c878468 100644
+--- a/common/collection/collection_queue.h
++++ b/common/collection/collection_queue.h
+@@ -144,7 +144,7 @@ int col_enqueue_binary_property(struct collection_item *queue,
+  */
+ int col_enqueue_int_property(struct collection_item *queue,
+                              const char *property,
+-                             int number);
++                             int32_t number);
+ /**
+  * @brief Add unsigned value to the queue.
+  *
+@@ -167,7 +167,7 @@ int col_enqueue_int_property(struct collection_item *queue,
+  */
+ int col_enqueue_unsigned_property(struct collection_item *queue,
+                                   const char *property,
+-                                  unsigned int number);
++                                  uint32_t number);
+ /**
+  * @brief Add long integer value to the queue.
+  *
+@@ -190,7 +190,7 @@ int col_enqueue_unsigned_property(struct collection_item *queue,
+  */
+ int col_enqueue_long_property(struct collection_item *queue,
+                               const char *property,
+-                              long number);
++                              int64_t number);
+ /**
+  * @brief Add unsigned long value to the queue.
+  *
+@@ -213,7 +213,7 @@ int col_enqueue_long_property(struct collection_item *queue,
+  */
+ int col_enqueue_ulong_property(struct collection_item *queue,
+                                const char *property,
+-                               unsigned long number);
++                               uint64_t number);
+ /**
+  * @brief Add floating point value to the queue.
+  *
+diff --git a/common/collection/collection_stack.c b/common/collection/collection_stack.c
+index 503ada337d441a60ea5f08a972549b42f3b54b5e..509df511350f6cfd5b8ffcc9b949ada5f7961cff 100644
+--- a/common/collection/collection_stack.c
++++ b/common/collection/collection_stack.c
+@@ -106,7 +106,7 @@ int col_push_binary_property(struct collection_item *stack,
+ /* Push an int property to stack. */
+ int col_push_int_property(struct collection_item *stack,
+                           const char *property,
+-                          int number)
++                          int32_t number)
+ {
+     int error = EOK;
+ 
+@@ -133,7 +133,7 @@ int col_push_int_property(struct collection_item *stack,
+ /* Push an unsigned int property to stack. */
+ int col_push_unsigned_property(struct collection_item *stack,
+                                const char *property,
+-                               unsigned int number)
++                               uint32_t number)
+ {
+     int error = EOK;
+ 
+@@ -161,7 +161,7 @@ int col_push_unsigned_property(struct collection_item *stack,
+ /* Push a long property. */
+ int col_push_long_property(struct collection_item *stack,
+                            const char *property,
+-                           long number)
++                           int64_t number)
+ {
+     int error = EOK;
+ 
+@@ -188,7 +188,7 @@ int col_push_long_property(struct collection_item *stack,
+ /* Push an unsigned long property. */
+ int col_push_ulong_property(struct collection_item *stack,
+                             const char *property,
+-                            unsigned long number)
++                            uint64_t number)
+ {
+     int error = EOK;
+ 
+diff --git a/common/collection/collection_stack.h b/common/collection/collection_stack.h
+index e4be156ba4e26ee5f69ab39f3dd395a501d16c35..f9b01309fce8cb19b16083fcabe855521a6ced34 100644
+--- a/common/collection/collection_stack.h
++++ b/common/collection/collection_stack.h
+@@ -145,7 +145,7 @@ int col_push_binary_property(struct collection_item *stack,
+  */
+ int col_push_int_property(struct collection_item *stack,
+                           const char *property,
+-                          int number);
++                          int32_t number);
+ /**
+  * @brief Push unsigned value to the stack.
+  *
+@@ -168,7 +168,7 @@ int col_push_int_property(struct collection_item *stack,
+  */
+ int col_push_unsigned_property(struct collection_item *stack,
+                                const char *property,
+-                               unsigned int number);
++                               uint32_t number);
+ /**
+  * @brief Push long integer value to the stack.
+  *
+@@ -191,7 +191,7 @@ int col_push_unsigned_property(struct collection_item *stack,
+  */
+ int col_push_long_property(struct collection_item *stack,
+                            const char *property,
+-                           long number);
++                           int64_t number);
+ /**
+  * @brief Push unsigned long value to the stack.
+  *
+@@ -214,7 +214,7 @@ int col_push_long_property(struct collection_item *stack,
+  */
+ int col_push_ulong_property(struct collection_item *stack,
+                             const char *property,
+-                            unsigned long number);
++                            uint64_t number);
+ /**
+  * @brief Push floating point value to the stack.
+  *
+diff --git a/common/collection/configure.ac b/common/collection/configure.ac
+index 25aba1628dafe76a2422bc03abbae0c92cf99bbd..02c0ab4c30820d8dbfeae9eb83a88ffc5627bacc 100644
+--- a/common/collection/configure.ac
++++ b/common/collection/configure.ac
+@@ -1,5 +1,5 @@
+ AC_INIT([collection],
+-        [0.4.0],
++        [0.5.0],
+         [sssd-devel@lists.fedorahosted.org])
+ AC_CONFIG_SRCDIR([collection.c])
+ AC_CONFIG_AUX_DIR([build])
+diff --git a/contrib/sssd.spec.in b/contrib/sssd.spec.in
+index 6a69275dacd37725c1dec5b5bdd61ff3f357f710..cd5d440c6ca8599c84dd43a948358ee38e79786f 100644
+--- a/contrib/sssd.spec.in
++++ b/contrib/sssd.spec.in
+@@ -367,8 +367,8 @@ rm -rf $RPM_BUILD_ROOT
+ %defattr(-,root,root,-)
+ %doc common/collection/COPYING
+ %doc common/collection/COPYING.LESSER
+-%{_libdir}/libcollection.so.1
+-%{_libdir}/libcollection.so.1.0.0
++%{_libdir}/libcollection.so.2
++%{_libdir}/libcollection.so.2.0.0
+ 
+ %files -n libcollection-devel
+ %defattr(-,root,root,-)
+@@ -453,4 +453,3 @@ fi
+ %changelog
+ * Mon Mar 15 2010 Stephen Gallagher <sgallagh@redhat.com> - @PACKAGE_VERSION@-0@PRERELEASE_VERSION@
+ - Automated build of the SSSD
+-
+-- 
+1.7.0.1
+
