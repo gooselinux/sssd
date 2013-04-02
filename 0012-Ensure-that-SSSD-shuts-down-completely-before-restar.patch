@@ -1,0 +1,34 @@
+From 9ac2cc99008c02bb0fac9efb3922077a20a2e6fb Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Wed, 17 Nov 2010 08:29:19 -0500
+Subject: [PATCH 12/12] Ensure that SSSD shuts down completely before restarting
+
+---
+ src/sysv/sssd |    9 +++++++++
+ 1 files changed, 9 insertions(+), 0 deletions(-)
+
+diff --git a/src/sysv/sssd b/src/sysv/sssd
+index 47804371d0be6b537bc03226f0fd67d03c6ce58e..7339d86deb9792285691032bebb5205f4894a671 100644
+--- a/src/sysv/sssd
++++ b/src/sysv/sssd
+@@ -48,8 +48,17 @@ start() {
+ 
+ stop() {
+     echo -n $"Stopping $prog: "
++    pid=`cat $PID_FILE`
++
+     killproc -p $PID_FILE $SSSD -TERM
+     RETVAL=$?
++
++    # Wait until the monitor exits
++    while (checkpid $pid)
++    do
++        usleep 100000
++    done
++
+     echo
+     [ "$RETVAL" = 0 ] && rm -f $LOCK_FILE
+     return $RETVAL
+-- 
+1.7.3.2
+

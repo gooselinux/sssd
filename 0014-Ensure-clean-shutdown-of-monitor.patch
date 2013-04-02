@@ -1,0 +1,269 @@
+From fc3ce0d01206b49dee8185cfe62867ed28ef22a8 Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Wed, 1 Dec 2010 08:51:49 -0500
+Subject: [PATCH 14/14] Ensure clean shutdown of monitor
+
+Make default SIGTERM and SIGINT handlers use tevent
+
+Wait for all children to exit
+
+Previously, there was a race-condition where the monitor might
+terminate before its children.
+
+Resend SIGTERM if child doesn't terminate
+
+There is a race condition where if we send a SIGTERM before the
+kernel has scheduled the child, it may be lost, and the child will
+not terminate and will leave the monitor hung in wait().
+
+This patch alters this behavior so that we will send the SIGTERM
+again every 10ms and check the wait() in a nonblocking manner.
+
+Set up signal handlers before initializing sysdb
+
+A temporary signal handler for SIGTERM is set up in server_setup()
+that calls exit() from within a pure signal handler. This causes a
+race condition where it's possible that if the SSSD is restarted
+immediately while it is still initializing the sysdb caches for
+the first time, it can leave the cache in a corrupt and unusable
+state.
+
+https://bugzilla.redhat.com/show_bug.cgi?id=658444
+---
+ src/monitor/monitor.c |  138 ++++++++++++++++++++++++++++++++++++++-----------
+ src/util/server.c     |   34 ++++++++++++-
+ 2 files changed, 140 insertions(+), 32 deletions(-)
+
+diff --git a/src/monitor/monitor.c b/src/monitor/monitor.c
+index 91bcb9a116021587dffe0a68f07b12c2898f18d0..1a62f69a58677fde2128a9336cd5c9878bf1e79b 100644
+--- a/src/monitor/monitor.c
++++ b/src/monitor/monitor.c
+@@ -1145,16 +1145,91 @@ static void monitor_quit(struct tevent_context *ev,
+                          void *siginfo,
+                          void *private_data)
+ {
++    struct mt_ctx *mt_ctx = talloc_get_type(private_data, struct mt_ctx);
++    struct mt_svc *svc;
++    pid_t pid;
++    int status;
++    errno_t error;
++    int kret;
++    bool killed;
++
+     DEBUG(8, ("Received shutdown command\n"));
+-    monitor_cleanup();
++
++    DEBUG(0, ("Monitor received %s: terminating children\n",
++              strsignal(signum)));
++
++    /* Kill all of our known children manually */
++    DLIST_FOR_EACH(svc, mt_ctx->svc_list) {
++        if (svc->pid == 0) {
++            /* The local provider has no PID */
++            continue;
++        }
++
++        killed = false;
++        DEBUG(1, ("Terminating [%s][%d]\n", svc->name, svc->pid));
++        do {
++            errno = 0;
++            kret = kill(svc->pid, SIGTERM);
++            if (kret < 0) {
++                error = errno;
++                DEBUG(1, ("Couldn't kill [%s][%d]: [%s]\n",
++                          svc->name, svc->pid, strerror(error)));
++            }
++
++            do {
++                errno = 0;
++                pid = waitpid(svc->pid, &status, WNOHANG);
++                if (pid == -1) {
++                    /* An error occurred while waiting */
++                    error = errno;
++                    if (error != EINTR) {
++                        DEBUG(0, ("[%d][%s] while waiting for [%s]\n",
++                                  error, strerror(error), svc->name));
++                        /* Forcibly kill this child */
++                        kill(svc->pid, SIGKILL);
++                        break;
++                    }
++                } else if (pid != 0) {
++                    error = 0;
++                    if WIFEXITED(status) {
++                        DEBUG(1, ("Child [%s] exited gracefully\n", svc->name));
++                    } else if WIFSIGNALED(status) {
++                        DEBUG(1, ("Child [%s] terminated with a signal\n", svc->name));
++                    } else {
++                        DEBUG(0, ("Child [%s] did not exit cleanly\n", svc->name));
++                        /* Forcibly kill this child */
++                        kill(svc->pid, SIGKILL);
++                    }
++                    killed = true;
++                }
++            } while (error == EINTR);
++            if (!killed) {
++                /* Sleep 10ms and try again */
++                usleep(10000);
++            }
++        } while (!killed);
++    }
+ 
+ #if HAVE_GETPGRP
++    /* Kill any remaining children in our process group, just in case
++     * we have any leftover children we don't expect. For example, if
++     * a krb5_child or ldap_child is running at the same moment.
++     */
++    error = 0;
+     if (getpgrp() == getpid()) {
+-        DEBUG(0,("%s: killing children\n", strsignal(signum)));
+         kill(-getpgrp(), SIGTERM);
++        do {
++            errno = 0;
++            pid = waitpid(0, &status, 0);
++            if (pid == -1) {
++                error = errno;
++            }
++        } while (error == EINTR || pid > 0);
+     }
+ #endif
+ 
++    monitor_cleanup();
++
+     exit(0);
+ }
+ 
+@@ -1694,6 +1769,36 @@ int monitor_process_init(struct mt_ctx *ctx,
+     int num_providers;
+     int ret;
+ 
++    /* Set up an event handler for a SIGHUP */
++    tes = tevent_add_signal(ctx->ev, ctx, SIGHUP, 0,
++                            monitor_hup, ctx);
++    if (tes == NULL) {
++        return EIO;
++    }
++
++    /* Set up an event handler for a SIGINT */
++    BlockSignals(false, SIGINT);
++    tes = tevent_add_signal(ctx->ev, ctx, SIGINT, 0,
++                            monitor_quit, ctx);
++    if (tes == NULL) {
++        return EIO;
++    }
++
++    /* Set up an event handler for a SIGTERM */
++    tes = tevent_add_signal(ctx->ev, ctx, SIGTERM, 0,
++                            monitor_quit, ctx);
++    if (tes == NULL) {
++        return EIO;
++    }
++
++    /* Handle SIGUSR1 (tell all providers to go offline) */
++    BlockSignals(false, SIGUSR1);
++    tes = tevent_add_signal(ctx->ev, ctx, SIGUSR1, 0,
++                            signal_offline, ctx);
++    if (tes == NULL) {
++        return EIO;
++    }
++
+ #if 0
+     This feature is incomplete and can leave the SSSD in a bad state if the
+     config file is changed while the SSSD is running.
+@@ -1771,35 +1876,6 @@ int monitor_process_init(struct mt_ctx *ctx,
+     /* now start checking for global events */
+     set_global_checker(ctx);
+ 
+-    /* Set up an event handler for a SIGHUP */
+-    tes = tevent_add_signal(ctx->ev, ctx, SIGHUP, 0,
+-                            monitor_hup, ctx);
+-    if (tes == NULL) {
+-        return EIO;
+-    }
+-
+-    /* Set up an event handler for a SIGINT */
+-    tes = tevent_add_signal(ctx->ev, ctx, SIGINT, 0,
+-                            monitor_quit, ctx);
+-    if (tes == NULL) {
+-        return EIO;
+-    }
+-
+-    /* Set up an event handler for a SIGTERM */
+-    tes = tevent_add_signal(ctx->ev, ctx, SIGTERM, 0,
+-                            monitor_quit, ctx);
+-    if (tes == NULL) {
+-        return EIO;
+-    }
+-
+-    /* Handle SIGUSR1 (tell all providers to go offline) */
+-    BlockSignals(false, SIGUSR1);
+-    tes = tevent_add_signal(ctx->ev, ctx, SIGUSR1, 0,
+-                            signal_offline, ctx);
+-    if (tes == NULL) {
+-        return EIO;
+-    }
+-
+     return EOK;
+ }
+ 
+diff --git a/src/util/server.c b/src/util/server.c
+index 446e2ea654f64251c20e08fa55643f7ada6f11b8..c177a5dd212155816cf3f7d2bfbac50506a2e2f7 100644
+--- a/src/util/server.c
++++ b/src/util/server.c
+@@ -232,6 +232,25 @@ void sig_term(int sig)
+     exit(0);
+ }
+ 
++static void default_quit(struct tevent_context *ev,
++                         struct tevent_signal *se,
++                         int signum,
++                         int count,
++                         void *siginfo,
++                         void *private_data)
++{
++#if HAVE_GETPGRP
++    static int done_sigterm;
++    if (done_sigterm == 0 && getpgrp() == getpid()) {
++        DEBUG(0,("SIGTERM: killing children\n"));
++        done_sigterm = 1;
++        kill(-getpgrp(), SIGTERM);
++    }
++#endif
++    sss_log(SSS_LOG_INFO, "Shutting down");
++    exit(0);
++}
++
+ #ifndef HAVE_PRCTL
+ static void sig_segv_abrt(int sig)
+ {
+@@ -274,7 +293,6 @@ static void setup_signals(void)
+ 	BlockSignals(false, SIGTERM);
+ 
+ 	CatchSignal(SIGHUP, sig_hup);
+-	CatchSignal(SIGTERM, sig_term);
+ 
+ #ifndef HAVE_PRCTL
+         /* If prctl is not defined on the system, try to handle
+@@ -389,6 +407,20 @@ int server_setup(const char *name, int flags,
+         return 1;
+     }
+ 
++    /* Set up an event handler for a SIGINT */
++    tes = tevent_add_signal(event_ctx, event_ctx, SIGINT, 0,
++                            default_quit, NULL);
++    if (tes == NULL) {
++        return EIO;
++    }
++
++    /* Set up an event handler for a SIGTERM */
++    tes = tevent_add_signal(event_ctx, event_ctx, SIGTERM, 0,
++                            default_quit, NULL);
++    if (tes == NULL) {
++        return EIO;
++    }
++
+     ctx = talloc(event_ctx, struct main_context);
+     if (ctx == NULL) {
+         DEBUG(0,("Out of memory, aborting!\n"));
+-- 
+1.7.3.2
+

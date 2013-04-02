@@ -7,7 +7,7 @@ Name: sssd
 Version: 1.2.1
 #Never reset the Release, always increment it
 #Otherwise we can have issues if library versions do not change
-Release: 28%{?dist}.2
+Release: 28%{?dist}.4
 Group: Applications/System
 Summary: System Security Services Daemon
 License: GPLv3+
@@ -33,13 +33,16 @@ Patch0008: 0008-Fix-chpass-operations-with-LDAP-provider.patch
 Patch0009: 0009-Treat-a-zero-length-password-as-a-failure.patch
 Patch0010: 0010-Assorted-fixes-for-group-processing.patch
 Patch0011: 0011-Don-t-clean-up-groups-for-which-a-user-has-it-as-pri.patch
+Patch0012: 0012-Ensure-that-SSSD-shuts-down-completely-before-restar.patch
+Patch0013: 0013-Always-use-uint32_t-for-UID-GID-numbers.patch
+Patch0014: 0014-Ensure-clean-shutdown-of-monitor.patch
 
 ### Dependencies ###
 
 Requires: libldb >= 0.9.3
 Requires: libtdb >= 1.1.3
 Requires: sssd-client = %{version}-%{release}
-Requires: libdhash = %{dhash_version}
+Requires: libdhash = %{dhash_version}-%{release}
 Requires: libcollection = %{collection_version}-%{release}
 Requires: libini_config = %{ini_config_version}-%{release}
 Requires: cyrus-sasl-gssapi
@@ -212,7 +215,21 @@ A dynamically-growing, reference-counted array
 
 %prep
 %setup -q
-for i in %patches ; do %__patch -p1 < $i ; done
+
+%patch0001 -p1
+%patch0002 -p1
+%patch0003 -p1
+%patch0004 -p1
+%patch0005 -p1
+%patch0006 -p1
+%patch0007 -p1
+%patch0008 -p1
+%patch0009 -p1
+%patch0010 -p1
+%patch0011 -p1
+%patch0012 -p1
+%patch0013 -p1
+%patch0014 -p1
 
 %build
 %configure \
@@ -314,7 +331,7 @@ rm -rf $RPM_BUILD_ROOT
 %attr(700,root,root) %dir %{pipepath}/private
 %attr(750,root,root) %dir %{_var}/log/%{name}
 %attr(700,root,root) %dir %{_sysconfdir}/sssd
-%config(noreplace) %{_sysconfdir}/sssd/sssd.conf
+%config(noreplace) %verify(not md5 size mtime) %{_sysconfdir}/sssd/sssd.conf
 %config(noreplace) %{_sysconfdir}/logrotate.d/sssd
 %config(noreplace) %{_sysconfdir}/rwtab.d/sssd
 %config %{_sysconfdir}/sssd/sssd.api.conf
@@ -460,6 +477,14 @@ fi
 %postun -n libref_array -p /sbin/ldconfig
 
 %changelog
+* Tue Dec 07 2010 Stephen Gallagher <sgallagh@redhat.com> - 1.2.1-28.4
+- Resolves: rhbz#660592 - SSSD shutdown sometimes hangs
+- Resolves: rhbz#660585 - getent passwd <username>' returns nothing if its
+-                         uidNumber gt 2147483647
+
+* Tue Nov 30 2010 Stephen Gallagher <sgallagh@redhat.com> - 1.2.1-28.3
+- Resolves: rhbz#658374 - sssd stops on upgrade
+
 * Wed Nov 03 2010 Stephen Gallagher <sgallagh@redhat.com> - 1.2.1-28.2
 - Resolves: rhbz#649312 - SSSD will sometimes lose groups from the cache
 

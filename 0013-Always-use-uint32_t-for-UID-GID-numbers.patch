@@ -1,0 +1,428 @@
+From 310f0f9ee101bad76246e33e95fcd944e296ad15 Mon Sep 17 00:00:00 2001
+From: Jakub Hrozek <jhrozek@redhat.com>
+Date: Fri, 15 Oct 2010 09:40:56 +0200
+Subject: [PATCH 13/13] Always use uint32_t for UID/GID numbers
+
+Add sysdb_attrs_get_ulong utility function
+
+Use unsigned long for conversion to id_t
+
+We used strtol() on a number of places to convert into uid_t or gid_t
+from a string representation such as LDAP attribute, but on some
+platforms, unsigned long might be necessary to store big id_t values.
+
+This patch converts to using strtoul() instead.
+
+Always use uint32_t for UID/GID numbers
+---
+ src/Makefile.am                          |    1 +
+ src/db/sysdb.c                           |   26 +++++++++++
+ src/db/sysdb.h                           |    2 +
+ src/providers/ldap/ldap_id.c             |   11 ++---
+ src/providers/ldap/sdap_async_accounts.c |   67 +++++++----------------------
+ src/providers/proxy/proxy.c              |    7 +--
+ src/tests/strtonum-tests.c               |   20 ++++----
+ src/util/find_uid.c                      |   11 +++--
+ src/util/strtonum.c                      |    2 +-
+ 9 files changed, 70 insertions(+), 77 deletions(-)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 1554ebb37fcab5ab74714a90abffda6f556f972e..5d77a128c470bb7f0979276bc31fcd8dfed7de96 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -634,6 +634,7 @@ ipa_timerules_tests_LDADD = \
+ 
+ find_uid_tests_SOURCES = \
+     tests/find_uid-tests.c \
++    util/strtonum.c \
+     util/find_uid.c \
+     $(SSSD_DEBUG_OBJ)
+ find_uid_tests_CFLAGS = \
+diff --git a/src/db/sysdb.c b/src/db/sysdb.c
+index 0091023b6e055b56f7f2a799f3ab31c234128dcf..6488c225f542ce82afc7f8c975764b3d35815ea1 100644
+--- a/src/db/sysdb.c
++++ b/src/db/sysdb.c
+@@ -20,6 +20,7 @@
+ */
+ 
+ #include "util/util.h"
++#include "util/strtonum.h"
+ #include "db/sysdb_private.h"
+ #include "confdb/confdb.h"
+ #include <time.h>
+@@ -170,6 +171,31 @@ int sysdb_attrs_get_string(struct sysdb_attrs *attrs, const char *name,
+     return EOK;
+ }
+ 
++int sysdb_attrs_get_uint32_t(struct sysdb_attrs *attrs, const char *name,
++                             uint32_t *value)
++{
++    struct ldb_message_element *el;
++    int ret;
++    char *endptr;
++    uint32_t val;
++
++    ret = sysdb_attrs_get_el_int(attrs, name, false, &el);
++    if (ret) {
++        return ret;
++    }
++
++    if (el->num_values != 1) {
++        return ERANGE;
++    }
++
++    val = strtouint32((const char *) el->values[0].data, &endptr, 0);
++    if (errno != 0) return errno;
++    if (*endptr) return EINVAL;
++
++    *value = val;
++    return EOK;
++}
++
+ int sysdb_attrs_get_string_array(struct sysdb_attrs *attrs, const char *name,
+                                  TALLOC_CTX *mem_ctx, const char ***string)
+ {
+diff --git a/src/db/sysdb.h b/src/db/sysdb.h
+index e3e69d3b0247ff5577c20e2795b98aa480534b2e..9a3bcd1a55e0a971af20e7da8c22664c6370b820 100644
+--- a/src/db/sysdb.h
++++ b/src/db/sysdb.h
+@@ -178,6 +178,8 @@ int sysdb_attrs_get_string(struct sysdb_attrs *attrs, const char *name,
+                            const char **string);
+ int sysdb_attrs_get_string_array(struct sysdb_attrs *attrs, const char *name,
+                                  TALLOC_CTX *mem_ctx, const char ***string);
++int sysdb_attrs_get_uint32_t(struct sysdb_attrs *attrs, const char *name,
++                             uint32_t *value);
+ 
+ int sysdb_attrs_replace_name(struct sysdb_attrs *attrs, const char *oldname,
+                                  const char *newname);
+diff --git a/src/providers/ldap/ldap_id.c b/src/providers/ldap/ldap_id.c
+index f0e96677868811c7ee7a6d1a20339dcf61a3d85f..5cf593db8076ca41ad15ec915711498c575d274a 100644
+--- a/src/providers/ldap/ldap_id.c
++++ b/src/providers/ldap/ldap_id.c
+@@ -27,6 +27,7 @@
+ #include <sys/time.h>
+ 
+ #include "util/util.h"
++#include "util/strtonum.h"
+ #include "db/sysdb.h"
+ #include "providers/ldap/ldap_common.h"
+ #include "providers/ldap/sdap_async.h"
+@@ -200,10 +201,9 @@ static void users_get_done(struct tevent_req *subreq)
+             return;
+ 
+         case BE_FILTER_IDNUM:
+-            errno = 0;
+-            uid = (uid_t)strtol(state->name, &endptr, 0);
++            uid = (uid_t) strtouint32(state->name, &endptr, 0);
+             if (errno || *endptr || (state->name == endptr)) {
+-                tevent_req_error(req, errno);
++                tevent_req_error(req, errno ? errno : EINVAL);
+                 return;
+             }
+ 
+@@ -421,10 +421,9 @@ static void groups_get_done(struct tevent_req *subreq)
+             return;
+ 
+         case BE_FILTER_IDNUM:
+-            errno = 0;
+-            gid = (gid_t)strtol(state->name, &endptr, 0);
++            gid = (gid_t) strtouint32(state->name, &endptr, 0);
+             if (errno || *endptr || (state->name == endptr)) {
+-                tevent_req_error(req, errno);
++                tevent_req_error(req, errno ? errno : EINVAL);
+                 return;
+             }
+ 
+diff --git a/src/providers/ldap/sdap_async_accounts.c b/src/providers/ldap/sdap_async_accounts.c
+index bc242719f17b16cfd44db80ab2356596e34fc9d9..9a950d7314110b5d4dac17128d967d1ecda31a98 100644
+--- a/src/providers/ldap/sdap_async_accounts.c
++++ b/src/providers/ldap/sdap_async_accounts.c
+@@ -57,7 +57,6 @@ static struct tevent_req *sdap_save_user_send(TALLOC_CTX *memctx,
+     const char *gecos;
+     const char *homedir;
+     const char *shell;
+-    long int l;
+     uid_t uid;
+     gid_t gid;
+     struct sysdb_attrs *user_attrs;
+@@ -111,22 +110,15 @@ static struct tevent_req *sdap_save_user_send(TALLOC_CTX *memctx,
+     if (el->num_values == 0) shell = NULL;
+     else shell = (const char *)el->values[0].data;
+ 
+-    ret = sysdb_attrs_get_el(state->attrs,
+-                             opts->user_map[SDAP_AT_USER_UID].sys_name, &el);
+-    if (ret) goto fail;
+-    if (el->num_values == 0) {
++    ret = sysdb_attrs_get_uint32_t(attrs,
++                                   opts->user_map[SDAP_AT_USER_UID].sys_name,
++                                   &uid);
++    if (ret != EOK) {
+         DEBUG(1, ("no uid provided for [%s] in domain [%s].\n",
+                   state->name, dom->name));
+         ret = EINVAL;
+         goto fail;
+     }
+-    errno = 0;
+-    l = strtol((const char *)el->values[0].data, NULL, 0);
+-    if (errno) {
+-        ret = EINVAL;
+-        goto fail;
+-    }
+-    uid = l;
+ 
+     /* check that the uid is valid for this domain */
+     if (OUT_OF_ID_RANGE(uid, dom->id_min, dom->id_max)) {
+@@ -136,22 +128,15 @@ static struct tevent_req *sdap_save_user_send(TALLOC_CTX *memctx,
+         goto fail;
+     }
+ 
+-    ret = sysdb_attrs_get_el(state->attrs,
+-                             opts->user_map[SDAP_AT_USER_GID].sys_name, &el);
+-    if (ret) goto fail;
+-    if (el->num_values == 0) {
++    ret = sysdb_attrs_get_uint32_t(attrs,
++                                   opts->user_map[SDAP_AT_USER_GID].sys_name,
++                                   &gid);
++    if (ret != EOK) {
+         DEBUG(1, ("no gid provided for [%s] in domain [%s].\n",
+                   state->name, dom->name));
+         ret = EINVAL;
+         goto fail;
+     }
+-    errno = 0;
+-    l = strtol((const char *)el->values[0].data, NULL, 0);
+-    if (errno) {
+-        ret = EINVAL;
+-        goto fail;
+-    }
+-    gid = l;
+ 
+     /* check that the gid is valid for this domain */
+     if (OUT_OF_ID_RANGE(gid, dom->id_min, dom->id_max)) {
+@@ -830,7 +815,6 @@ static struct tevent_req *sdap_save_group_send(TALLOC_CTX *memctx,
+     struct sdap_save_group_state *state;
+     struct ldb_message_element *el;
+     struct sysdb_attrs *group_attrs;
+-    long int l;
+     gid_t gid;
+     int ret;
+ 
+@@ -852,22 +836,15 @@ static struct tevent_req *sdap_save_group_send(TALLOC_CTX *memctx,
+     }
+     state->name = (const char *)el->values[0].data;
+ 
+-    ret = sysdb_attrs_get_el(attrs,
+-                          opts->group_map[SDAP_AT_GROUP_GID].sys_name, &el);
+-    if (ret) goto fail;
+-    if (el->num_values == 0) {
++    ret = sysdb_attrs_get_uint32_t(attrs,
++                                   opts->group_map[SDAP_AT_GROUP_GID].sys_name,
++                                   &gid);
++    if (ret != EOK) {
+         DEBUG(1, ("no gid provided for [%s] in domain [%s].\n",
+                   state->name, dom->name));
+         ret = EINVAL;
+         goto fail;
+     }
+-    errno = 0;
+-    l = strtol((const char *)el->values[0].data, NULL, 0);
+-    if (errno) {
+-        ret = EINVAL;
+-        goto fail;
+-    }
+-    gid = l;
+ 
+     /* check that the gid is valid for this domain */
+     if (OUT_OF_ID_RANGE(gid, dom->id_min, dom->id_max)) {
+@@ -2377,26 +2354,14 @@ static void sdap_add_incomplete_groups_next(struct tevent_req *subreq)
+             name = (const char *)el->values[0].data;
+ 
+             if (strcmp(name, state->groupnames[state->cur]) == 0) {
+-                ret = sysdb_attrs_get_el(state->ldap_groups[ai],
+-                                        SYSDB_GIDNUM,
+-                                        &el);
++                ret = sysdb_attrs_get_uint32_t(state->ldap_groups[ai],
++                                               SYSDB_GIDNUM,
++                                               &gid);
+                 if (ret) {
++                    DEBUG(1, ("no gid provided for [%s]\n", name));
+                     tevent_req_error(req, ret);
+                     return;
+                 }
+-                if (el->num_values == 0) {
+-                    DEBUG(1, ("no gid provided for [%s]\n",
+-                                name));
+-                    tevent_req_error(req, EINVAL);
+-                    return;
+-                }
+-
+-                errno = 0;
+-                gid = (gid_t) strtol((const char *)el->values[0].data, NULL, 0);
+-                if (errno) {
+-                    tevent_req_error(req, errno);
+-                    return;
+-                }
+ 
+                 add_req = sysdb_add_incomplete_group_send(state,
+                                                     state->ev,
+diff --git a/src/providers/proxy/proxy.c b/src/providers/proxy/proxy.c
+index 8bdc94aa69874395f406d20c7b8a06d84931243f..b501b584dcff59f96886617daa387c6909ac709f 100644
+--- a/src/providers/proxy/proxy.c
++++ b/src/providers/proxy/proxy.c
+@@ -31,6 +31,7 @@
+ #include <security/pam_modules.h>
+ 
+ #include "util/util.h"
++#include "util/strtonum.h"
+ #include "providers/dp_backend.h"
+ #include "db/sysdb.h"
+ #include "proxy.h"
+@@ -2822,8 +2823,7 @@ static void proxy_get_account_info(struct be_req *breq)
+                                    EINVAL, "Invalid attr type");
+             } else {
+                 char *endptr;
+-                errno = 0;
+-                uid = (uid_t)strtol(ar->filter_value, &endptr, 0);
++                uid = (uid_t) strtouint32(ar->filter_value, &endptr, 0);
+                 if (errno || *endptr || (ar->filter_value == endptr)) {
+                     return proxy_reply(breq, DP_ERR_FATAL,
+                                        EINVAL, "Invalid attr type");
+@@ -2877,8 +2877,7 @@ static void proxy_get_account_info(struct be_req *breq)
+                                    EINVAL, "Invalid attr type");
+             } else {
+                 char *endptr;
+-                errno = 0;
+-                gid = (gid_t)strtol(ar->filter_value, &endptr, 0);
++                gid = (gid_t) strtouint32(ar->filter_value, &endptr, 0);
+                 if (errno || *endptr || (ar->filter_value == endptr)) {
+                     return proxy_reply(breq, DP_ERR_FATAL,
+                                        EINVAL, "Invalid attr type");
+diff --git a/src/tests/strtonum-tests.c b/src/tests/strtonum-tests.c
+index a7131c1b5efffd9df2e7345bdeb02dcaa44363e5..f8e0f394239209f8b425a7cafdcdf8238ce3c65b 100644
+--- a/src/tests/strtonum-tests.c
++++ b/src/tests/strtonum-tests.c
+@@ -38,15 +38,15 @@
+ 
+ #define CHECK_RESULT(expected, actual) \
+     do { \
+-        fail_unless(result == expected, "Expected %ld, got %ld", \
+-                                        expected, result); \
++        fail_unless(actual == expected, "Expected %ld, got %ld", \
++                                        expected, actual); \
+     } while(0)
+ 
+ #define CHECK_ERRNO(expected, actual) \
+     do { \
+-        fail_unless(error == ERANGE, "Expected errno %d[%s], got %d[%s]", \
+-                                     ERANGE, strerror(ERANGE), \
+-                                     error, strerror(ERANGE)); \
++        fail_unless(actual == expected, "Expected errno %d[%s], got %d[%s]", \
++                                        expected, strerror(expected), \
++                                        actual, strerror(actual)); \
+     } while(0)
+ 
+ #define CHECK_ENDPTR(expected, actual) \
+@@ -146,7 +146,7 @@ START_TEST (test_strtoint32_pos_integer_overflow_base_10)
+ 
+     CHECK_ERRNO(ERANGE, error);
+     CHECK_ZERO_ENDPTR(endptr);
+-    CHECK_RESULT(expected, actual);
++    CHECK_RESULT(expected, result);
+ }
+ END_TEST
+ 
+@@ -163,7 +163,7 @@ START_TEST (test_strtoint32_pos_integer_underflow_base_10)
+ 
+     CHECK_ERRNO(ERANGE, error);
+     CHECK_ZERO_ENDPTR(endptr);
+-    CHECK_RESULT(expected, actual);
++    CHECK_RESULT(expected, result);
+ }
+ END_TEST
+ 
+@@ -265,14 +265,14 @@ START_TEST (test_strtouint32_neg_integer_base_10)
+ {
+     uint32_t result;
+     const char *input = "-123";
+-    uint32_t expected = -123;
++    uint32_t expected = UINT32_MAX;
+     char *endptr;
+     errno_t error;
+ 
+     result = strtouint32(input, &endptr, 10);
+     error = errno;
+ 
+-    EXPECT_UNSET_ERRNO(error);
++    CHECK_ERRNO(ERANGE, error);
+     CHECK_ZERO_ENDPTR(endptr);
+     CHECK_RESULT(expected, result);
+ }
+@@ -309,7 +309,7 @@ START_TEST (test_strtouint32_pos_integer_overflow_base_10)
+ 
+     CHECK_ERRNO(ERANGE, error);
+     CHECK_ZERO_ENDPTR(endptr);
+-    CHECK_RESULT(expected, actual);
++    CHECK_RESULT(expected, result);
+ }
+ END_TEST
+ 
+diff --git a/src/util/find_uid.c b/src/util/find_uid.c
+index 02d668636ab0abf439f55591a21a7d6209a79bf6..e18de7a4953b8be5f379ea10d04bc05f658089c0 100644
+--- a/src/util/find_uid.c
++++ b/src/util/find_uid.c
+@@ -38,6 +38,7 @@
+ 
+ #include "dhash.h"
+ #include "util/util.h"
++#include "util/strtonum.h"
+ 
+ #define INITIAL_TABLE_SIZE 64
+ #define PATHLEN (NAME_MAX + 14)
+@@ -63,7 +64,7 @@ static errno_t get_uid_from_pid(const pid_t pid, uid_t *uid)
+     char *p;
+     char *e;
+     char *endptr;
+-    long num=0;
++    uint32_t num=0;
+     errno_t error;
+ 
+     ret = snprintf(path, PATHLEN, "/proc/%d/status", pid);
+@@ -132,10 +133,10 @@ static errno_t get_uid_from_pid(const pid_t pid, uid_t *uid)
+             *e = '\0';
+         }
+         errno = 0;
+-        num = strtol(p, &endptr, 10);
++        num = strtouint32(p, &endptr, 10);
+         error = errno;
+-        if (error == ERANGE) {
+-            DEBUG(1, ("strtol failed [%s].\n", strerror(error)));
++        if (error != 0) {
++            DEBUG(1, ("strtoul failed [%s].\n", strerror(error)));
+             return error;
+         }
+         if (*endptr != '\0') {
+@@ -143,7 +144,7 @@ static errno_t get_uid_from_pid(const pid_t pid, uid_t *uid)
+             return EINVAL;
+         }
+ 
+-        if (num < 0 || num >= INT_MAX) {
++        if (num >= UINT32_MAX) {
+             DEBUG(1, ("uid out of range.\n"));
+             return ERANGE;
+         }
+diff --git a/src/util/strtonum.c b/src/util/strtonum.c
+index 744e0f71a28f733faef62ed7ad9242c6a147d6f1..bf1b21a62c6c92efb4f5cbe85dd306e9833c6f3d 100644
+--- a/src/util/strtonum.c
++++ b/src/util/strtonum.c
+@@ -51,7 +51,7 @@ int32_t strtoint32(const char *nptr, char **endptr, int base)
+ /* strtouint32 */
+ uint32_t strtouint32(const char *nptr, char **endptr, int base)
+ {
+-    long long ret = 0;
++    unsigned long long ret = 0;
+     errno = 0;
+     ret = strtoull(nptr, endptr, base);
+ 
+-- 
+1.7.3.2
+
