@@ -7,7 +7,7 @@ Name: sssd
 Version: 1.2.1
 #Never reset the Release, always increment it
 #Otherwise we can have issues if library versions do not change
-Release: 28%{?dist}
+Release: 28%{?dist}.2
 Group: Applications/System
 Summary: System Security Services Daemon
 License: GPLv3+
@@ -31,6 +31,8 @@ Patch0006: 0006-Allow-sssd-clients-to-reconnect.patch
 Patch0007: 0007-Clean-up-initgroups-processing-for-RFC2307.patch
 Patch0008: 0008-Fix-chpass-operations-with-LDAP-provider.patch
 Patch0009: 0009-Treat-a-zero-length-password-as-a-failure.patch
+Patch0010: 0010-Assorted-fixes-for-group-processing.patch
+Patch0011: 0011-Don-t-clean-up-groups-for-which-a-user-has-it-as-pri.patch
 
 ### Dependencies ###
 
@@ -38,13 +40,13 @@ Requires: libldb >= 0.9.3
 Requires: libtdb >= 1.1.3
 Requires: sssd-client = %{version}-%{release}
 Requires: libdhash = %{dhash_version}
-Requires: libcollection = %{collection_version}
-Requires: libini_config = %{ini_config_version}
+Requires: libcollection = %{collection_version}-%{release}
+Requires: libini_config = %{ini_config_version}-%{release}
 Requires: cyrus-sasl-gssapi
 Requires: keyutils-libs
-Requires(post): python
+Requires(post): python initscripts chkconfig /sbin/ldconfig
 Requires(preun):  initscripts chkconfig
-Requires(postun): /sbin/service
+Requires(postun): initscripts chkconfig /sbin/ldconfig
 
 %global servicename sssd
 %global sssdstatedir %{_localstatedir}/lib/sss
@@ -170,7 +172,7 @@ and serialization
 Summary: INI file parser for C
 Group: Development/Libraries
 Version: %{ini_config_version}
-Requires: libcollection = %{collection_version}
+Requires: libcollection = %{collection_version}-%{release}
 License: LGPLv3+
 
 %description -n libini_config
@@ -182,6 +184,7 @@ Summary: Development files for libini_config
 Group: Development/Libraries
 Version: %{ini_config_version}
 Requires: libini_config = %{ini_config_version}-%{release}
+Requires: libcollection-devel = %{collection_version}-%{release}
 License: LGPLv3+
 
 %description -n libini_config-devel
@@ -218,6 +221,7 @@ for i in %patches ; do %__patch -p1 < $i ; done
     --with-pubconf-path=%{pubconfpath} \
     --with-init-dir=%{_initrddir} \
     --enable-nsslibdir=/%{_lib} \
+    --enable-pammoddir=/%{_lib}/security \
     --disable-static \
     --disable-rpath
 
@@ -280,12 +284,6 @@ rm -f \
     $RPM_BUILD_ROOT/%{_libdir}/krb5/plugins/libkrb5/sssd_krb5_locator_plugin.la \
     $RPM_BUILD_ROOT/%{python_sitearch}/pysss.la
 
-if test -e $RPM_BUILD_ROOT/%{_libdir}/krb5/plugins/libkrb5/sssd_krb5_locator_plugin.so
-then
-    # Apppend this file to the sss_daemon.lang
-    # Older versions of rpmbuild can only handle one -f option
-    echo %{_libdir}/krb5/plugins/libkrb5/sssd_krb5_locator_plugin.so >> sss_daemon.lang
-fi
 for file in `ls $RPM_BUILD_ROOT/%{python_sitelib}/*.egg-info 2> /dev/null`
 do
     echo %{python_sitelib}/`basename $file` >> sss_daemon.lang
@@ -335,7 +333,6 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man8/sss_useradd.8*
 %{_mandir}/man8/sss_userdel.8*
 %{_mandir}/man8/sss_usermod.8*
-%{_mandir}/man8/sssd_krb5_locator_plugin.8*
 %{python_sitearch}/pysss.so
 %{python_sitelib}/*.py*
 
@@ -345,7 +342,9 @@ rm -rf $RPM_BUILD_ROOT
 %doc src/sss_client/COPYING src/sss_client/COPYING.LESSER
 /%{_lib}/libnss_sss.so.2
 /%{_lib}/security/pam_sss.so
+%{_libdir}/krb5/plugins/libkrb5/sssd_krb5_locator_plugin.so
 %{_mandir}/man8/pam_sss.8*
+%{_mandir}/man8/sssd_krb5_locator_plugin.8*
 
 %files -n libdhash
 %defattr(-,root,root,-)
@@ -461,6 +460,13 @@ fi
 %postun -n libref_array -p /sbin/ldconfig
 
 %changelog
+* Wed Nov 03 2010 Stephen Gallagher <sgallagh@redhat.com> - 1.2.1-28.2
+- Resolves: rhbz#649312 - SSSD will sometimes lose groups from the cache
+
+* Mon Oct 11 2010 Stephen Gallagher <sgallagh@redhat.com> - 1.2.1-28.1
+- Resolves: rhbz#637070 - the krb5 locator plugin isn't packaged for multilib
+- Resolves: rhbz#642412 - SSSD initgroups does not behave as expected
+
 * Fri Sep 03 2010 Stephen Gallagher <sgallagh@redhat.com> - 1.2.1-28
 - Resolves: rhbz#629949 - sssd stops on upgrade
 

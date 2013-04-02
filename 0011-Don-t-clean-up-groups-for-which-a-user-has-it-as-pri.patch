@@ -1,0 +1,62 @@
+From 484c16c0e8891e92a45d2bcf44fe7638af08aea9 Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Wed, 3 Nov 2010 09:00:12 -0400
+Subject: [PATCH 12/12] Don't clean up groups for which a user has it as primary GID
+
+We were cleaning up all groups that were expired and for which
+there existed no user with memberOf: <thegroup> as an attribute.
+
+This patch modifies the search to also check for cached users with
+this group's GID as their primary GID.
+
+Fixes https://fedorahosted.org/sssd/ticket/624
+---
+ src/providers/ldap/ldap_id_cleanup.c |   18 +++++++++++++++---
+ 1 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/providers/ldap/ldap_id_cleanup.c b/src/providers/ldap/ldap_id_cleanup.c
+index 330094f7034dba34b91b871df9a2b1bf86633b5a..62a4c2d0201e94856d0226928273ace52d444fee 100644
+--- a/src/providers/ldap/ldap_id_cleanup.c
++++ b/src/providers/ldap/ldap_id_cleanup.c
+@@ -524,7 +524,7 @@ static struct tevent_req *cleanup_groups_send(TALLOC_CTX *memctx,
+ {
+     struct tevent_req *req, *subreq;
+     struct cleanup_groups_state *state;
+-    static const char *attrs[] = { SYSDB_NAME, NULL };
++    static const char *attrs[] = { SYSDB_NAME, SYSDB_GIDNUM, NULL };
+     time_t now = time(NULL);
+     char *subfilter;
+ 
+@@ -597,6 +597,7 @@ static void cleanup_groups_check_users(struct tevent_req *req)
+     struct tevent_req *subreq;
+     const char *subfilter;
+     const char *dn;
++    gid_t gid;
+ 
+     dn = ldb_dn_get_linearized(state->msgs[state->cur]->dn);
+     if (!dn) {
+@@ -604,8 +605,19 @@ static void cleanup_groups_check_users(struct tevent_req *req)
+         return;
+     }
+ 
+-    subfilter = talloc_asprintf(state, "(%s=%s)",
+-                                SYSDB_MEMBEROF, dn);
++    gid = (gid_t) ldb_msg_find_attr_as_uint(state->msgs[state->cur],
++                                            SYSDB_GIDNUM, 0);
++    if (!gid) {
++        tevent_req_error(req, EIO);
++        return;
++    }
++
++    /* Search for users that are members of this group, or
++     * that have this group as their primary GID
++     */
++    subfilter = talloc_asprintf(state, "(|(%s=%s)(%s=%lu))",
++                                SYSDB_MEMBEROF, dn,
++                                SYSDB_GIDNUM, (unsigned long) gid);
+     if (!subfilter) {
+         DEBUG(2, ("Failed to build filter\n"));
+         tevent_req_error(req, ENOMEM);
+-- 
+1.7.3.2
+
